@@ -300,6 +300,18 @@ impl LayerHop {
         Webhooks { client: self }
     }
 
+    /// Invoices: line items billed to a customer by email, paid through checkout. Everything needs
+    /// an API key except `public_view` and `pay` (the customer's side).
+    pub fn invoices(&self) -> Invoices<'_> {
+        Invoices { client: self }
+    }
+
+    /// `GET /v1/status` — public service status (status.layerhop.com): overall state, per-component
+    /// status and 90-day uptime, recent incidents. ([`LayerHop::status`] tracks one order.)
+    pub async fn service_status(&self) -> Result<StatusResponse> {
+        self.call(Method::GET, "/status", &[], None).await
+    }
+
     /// Poll [`LayerHop::status`] until the order is final (`filled` / `refunded` / `failed`),
     /// yielding each state change. Yields [`Error::Timeout`] (then ends) after `opts.timeout`,
     /// and ends after the first request error.
@@ -421,6 +433,101 @@ impl Checkout<'_> {
     /// `create`, `list` and `update` need an API key; `get` and `start_session` are public.
     pub fn products(&self) -> CheckoutProducts<'_> {
         CheckoutProducts { client: self.client }
+    }
+
+    /// Refunds of paid sessions (API key). Non-custodial: you sign the refund from your wallet.
+    pub fn refunds(&self) -> CheckoutRefunds<'_> {
+        CheckoutRefunds { client: self.client }
+    }
+}
+
+/// Checkout refund endpoints, from [`Checkout::refunds`].
+#[derive(Debug, Clone, Copy)]
+pub struct CheckoutRefunds<'a> {
+    client: &'a LayerHop,
+}
+
+impl CheckoutRefunds<'_> {
+    /// `POST /v1/checkout/sessions/{id}/refunds` — refund (part of) a `paid` session. Returns the
+    /// refund and its quote: [`LayerHop::build_tx`] the `quote_id`, sign it from `quote.from`, then
+    /// [`LayerHop::report_submitted`]. It completes when the order fills
+    /// (`checkout.session.refunded`).
+    pub async fn create(&self, session_id: &str, p: &CreateRefundParams) -> Result<CreateRefundResponse> {
+        let path = format!("/checkout/sessions/{}/refunds", urlencoding::encode(session_id));
+        self.client.call(Method::POST, &path, &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `GET /v1/checkout/sessions/{id}/refunds` — the session's refunds, newest first.
+    pub async fn list(&self, session_id: &str) -> Result<ListRefundsResponse> {
+        let path = format!("/checkout/sessions/{}/refunds", urlencoding::encode(session_id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+}
+
+/// Invoice endpoints, from [`LayerHop::invoices`].
+#[derive(Debug, Clone, Copy)]
+pub struct Invoices<'a> {
+    client: &'a LayerHop,
+}
+
+impl Invoices<'_> {
+    /// `POST /v1/invoices` — create a draft (or, with `send: Some(true)`, an open invoice emailed to
+    /// the customer).
+    pub async fn create(&self, p: &CreateInvoiceParams) -> Result<Invoice> {
+        self.client.call(Method::POST, "/invoices", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `GET /v1/invoices/{id}` — one of your invoices.
+    pub async fn get(&self, id: &str) -> Result<Invoice> {
+        let path = format!("/invoices/{}", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+
+    /// `GET /v1/invoices` — your invoices of the key's mode (live or test), newest first.
+    pub async fn list(&self, p: &ListInvoicesParams) -> Result<ListInvoicesResponse> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = &p.status {
+            q.push(("status", v.clone()));
+        }
+        if let Some(v) = &p.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        self.client.call(Method::GET, "/invoices", &q, None).await
+    }
+
+    /// `PATCH /v1/invoices/{id}` — edit a `draft` (`CONFLICT` otherwise); only `Some` fields change.
+    pub async fn update(&self, id: &str, p: &UpdateInvoiceParams) -> Result<Invoice> {
+        let path = format!("/invoices/{}", urlencoding::encode(id));
+        self.client.call(Method::PATCH, &path, &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `POST /v1/invoices/{id}/send` — finalize a draft (`open`) and email it; on an open invoice,
+    /// re-send the email. `CONFLICT` when paid or void.
+    pub async fn send(&self, id: &str) -> Result<Invoice> {
+        let path = format!("/invoices/{}/send", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `POST /v1/invoices/{id}/void` — cancel a draft or open invoice. `CONFLICT` when paid or void.
+    pub async fn void(&self, id: &str) -> Result<Invoice> {
+        let path = format!("/invoices/{}/void", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `GET /v1/invoices/{id}/public` — public: the customer's view of a sent invoice.
+    pub async fn public_view(&self, id: &str) -> Result<Invoice> {
+        let path = format!("/invoices/{}/public", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+
+    /// `POST /v1/invoices/{id}/pay` — public: start (or reuse) the checkout session that pays an
+    /// open invoice. Send the payer to its `url`.
+    pub async fn pay(&self, id: &str) -> Result<PayInvoiceResponse> {
+        let path = format!("/invoices/{}/pay", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
     }
 }
 

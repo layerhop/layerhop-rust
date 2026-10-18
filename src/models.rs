@@ -277,6 +277,8 @@ pub struct Order {
     pub livemode: Option<bool>,
     /// The checkout session this order pays, if any.
     pub checkout_session_id: Option<String>,
+    /// The checkout refund this order executes, if any.
+    pub refund_id: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -379,6 +381,12 @@ pub struct CheckoutSession {
     /// The product the session was started from, if any.
     #[serde(default)]
     pub product_id: Option<String>,
+    /// The invoice the session pays, if any.
+    #[serde(default)]
+    pub invoice_id: Option<String>,
+    /// Total of completed refunds, base units of the settlement token (`"0"` if none).
+    #[serde(default)]
+    pub refunded_amount: Option<String>,
     #[serde(default)]
     pub success_url: Option<String>,
     #[serde(default)]
@@ -610,7 +618,8 @@ pub struct WebhookEvent {
     pub id: String,
     /// `order.submitted` · `order.filled` · `order.refunded` · `order.failed` ·
     /// `checkout.session.processing` · `checkout.session.completed` ·
-    /// `checkout.session.payment_failed` · `checkout.session.expired` (or `webhook.test`).
+    /// `checkout.session.payment_failed` · `checkout.session.expired` ·
+    /// `checkout.session.refunded` · `invoice.sent` · `invoice.paid` (or `webhook.test`).
     #[serde(rename = "type")]
     pub event_type: String,
     pub livemode: bool,
@@ -622,14 +631,19 @@ pub struct WebhookEvent {
     pub data: WebhookEventData,
 }
 
-/// The object a [`WebhookEvent`] is about: `order` for `order.*` events, `session` for
-/// `checkout.session.*` events.
+/// The objects a [`WebhookEvent`] is about: `order` for `order.*` events, `session` for
+/// `checkout.session.*` events (plus `refund` for `checkout.session.refunded`), `invoice` for
+/// `invoice.*` events (plus the paying `session` for `invoice.paid`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WebhookEventData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Order>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<CheckoutSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refund: Option<Refund>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoice: Option<Invoice>,
 }
 
 /// Response of [`crate::Webhooks::trigger`] (`POST /v1/webhooks/trigger`).
@@ -640,6 +654,314 @@ pub struct TriggerWebhookResponse {
     /// Test endpoints the event was queued for.
     pub deliveries: u32,
     pub payload: WebhookEvent,
+}
+
+/// One line of an invoice; the line total is `unit_amount × quantity`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvoiceLineItem {
+    pub description: String,
+    /// 1–10000.
+    pub quantity: u32,
+    /// Integer string in base units of the settlement token.
+    pub unit_amount: String,
+}
+
+/// Parameters for [`crate::Invoices::create`] (`POST /v1/invoices`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateInvoiceParams {
+    /// Receives the invoice email (and the receipt once paid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merchant_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    /// 1–50 lines; the invoice amount is their sum.
+    pub line_items: Vec<InvoiceLineItem>,
+    /// Settlement chain id or slug.
+    pub settle_chain: String,
+    /// `"USDC"` or `"USDT"` (or its address) on that chain.
+    pub settle_token: String,
+    /// Your payout address on the settlement chain.
+    pub recipient: String,
+    /// ISO 8601 date (`"2026-11-01"`) or date-time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<String>,
+    /// `Some(true)` finalizes the invoice and emails it right away (status `open`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send: Option<bool>,
+}
+
+/// Parameters for [`crate::Invoices::update`] (`PATCH /v1/invoices/{id}`, drafts only).
+/// Only `Some` fields are sent; `Some(None)` on a nullable field sends `null` to clear it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInvoiceParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_email: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_name: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merchant_name: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<Option<String>>,
+    /// Replaces every line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_items: Option<Vec<InvoiceLineItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settle_chain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settle_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<Option<String>>,
+}
+
+/// An invoice (`object: "invoice"`): line items billed to a customer by email and paid through
+/// checkout. Owner-only fields (`customer_email`, `recipient`, `session_id`, `sent_at`, ...) are
+/// `None` in [`crate::Invoices::public_view`]. The `invoice.paid` webhook carries a summary, so
+/// `line_items` may be empty and `url` / `created_at` `None` there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Invoice {
+    pub id: String,
+    pub object: String,
+    pub livemode: bool,
+    /// `INV-0001`, numbered per account and mode.
+    pub number: String,
+    /// `draft` · `open` · `paid` · `void`.
+    pub status: String,
+    #[serde(default)]
+    pub merchant_name: Option<String>,
+    #[serde(default)]
+    pub customer_name: Option<String>,
+    #[serde(default)]
+    pub memo: Option<String>,
+    #[serde(default)]
+    pub line_items: Vec<InvoiceLineItem>,
+    /// Total, base units of the settlement token.
+    pub amount: String,
+    pub settlement: CheckoutSettlement,
+    #[serde(default)]
+    pub due_at: Option<String>,
+    #[serde(default)]
+    pub paid_at: Option<String>,
+    /// The hosted invoice page, `https://layerhop.com/invoice/{id}`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// PDF receipt, once paid.
+    #[serde(default)]
+    pub receipt_url: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Owner only.
+    #[serde(default)]
+    pub customer_email: Option<String>,
+    /// Owner only.
+    #[serde(default)]
+    pub recipient: Option<String>,
+    /// Owner only: the checkout session that pays (or last tried to pay) the invoice.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub sent_at: Option<String>,
+    #[serde(default)]
+    pub receipt_sent_at: Option<String>,
+    #[serde(default)]
+    pub voided_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+impl Invoice {
+    /// `paid`: the checkout session that pays it was verified on chain.
+    pub fn is_paid(&self) -> bool {
+        self.status == "paid"
+    }
+}
+
+/// Parameters for [`crate::Invoices::list`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListInvoicesParams {
+    /// `draft` · `open` · `paid` · `void`.
+    pub status: Option<String>,
+    pub cursor: Option<String>,
+    /// 1–100.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListInvoicesResponse {
+    #[serde(default)]
+    pub invoices: Vec<Invoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Response of [`crate::Invoices::pay`]: the checkout session that pays the invoice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayInvoiceResponse {
+    pub session_id: String,
+    /// The hosted checkout page: send the payer here.
+    pub url: String,
+}
+
+/// Parameters for [`crate::CheckoutRefunds::create`]. All optional.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRefundParams {
+    /// Base units of the settlement token; default: everything not yet refunded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The wallet that signs the refund (default: the session's payout address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// `original` (default): the payer's chain and token. `settlement`: the settlement token, to
+    /// the payer's address on the settlement chain (same chain family only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+/// Where a refund is delivered.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefundDestination {
+    pub chain_id: u64,
+    pub token: String,
+    pub address: String,
+}
+
+/// A refund of a paid checkout session (`object: "refund"`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Refund {
+    pub id: String,
+    pub object: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub livemode: Option<bool>,
+    /// `pending` · `submitted` · `completed` · `failed`.
+    pub status: String,
+    #[serde(default)]
+    pub status_detail: Option<String>,
+    /// Base units of the settlement token.
+    pub amount: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub quote_id: Option<String>,
+    pub to: RefundDestination,
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// The route that executes a refund: [`crate::LayerHop::build_tx`] it, sign it from `from`, then
+/// [`crate::LayerHop::report_submitted`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefundQuote {
+    pub quote_id: String,
+    pub provider: ProviderId,
+    /// Settlement-token base units sent by the merchant.
+    pub src_amount: String,
+    /// What the payer receives, base units of the refund token.
+    pub dst_amount: String,
+    pub dst_amount_min: String,
+    pub estimated_seconds: u64,
+    /// Unix seconds.
+    pub expires_at: u64,
+    /// The wallet that must sign the refund transaction.
+    pub from: String,
+}
+
+/// Response of [`crate::CheckoutRefunds::create`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRefundResponse {
+    pub refund: Refund,
+    pub quote: RefundQuote,
+    /// The remaining steps (build, sign, report).
+    #[serde(default)]
+    pub next: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListRefundsResponse {
+    #[serde(default)]
+    pub refunds: Vec<Refund>,
+}
+
+/// One day of a component's uptime history.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusDay {
+    /// `YYYY-MM-DD` (UTC).
+    pub date: String,
+    /// Percent of passing checks; `None` without data.
+    #[serde(default)]
+    pub uptime: Option<f64>,
+}
+
+/// A monitored component in [`StatusResponse`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusComponent {
+    pub id: String,
+    pub name: String,
+    pub group: String,
+    /// `operational` · `degraded` · `down`.
+    pub status: String,
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+    /// Percent over the last 90 days; `None` without data.
+    #[serde(default, rename = "uptime90d")]
+    pub uptime_90d: Option<f64>,
+    /// The last 90 days, oldest first.
+    #[serde(default)]
+    pub days: Vec<StatusDay>,
+}
+
+/// An incident from the last 14 days.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusIncident {
+    pub id: String,
+    pub component_id: String,
+    pub component: String,
+    pub title: String,
+    pub started_at: String,
+    /// `None` while ongoing.
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+}
+
+/// Response of [`crate::LayerHop::service_status`] (`GET /v1/status`, shown at
+/// status.layerhop.com).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusResponse {
+    /// `operational` · `degraded` · `outage`.
+    pub status: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub components: Vec<StatusComponent>,
+    #[serde(default)]
+    pub incidents: Vec<StatusIncident>,
+    pub url: String,
 }
 
 /// Accepts `"21000"` or `21000` and yields `Some("21000")`.
