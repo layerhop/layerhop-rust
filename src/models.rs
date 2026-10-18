@@ -376,6 +376,9 @@ pub struct CheckoutSession {
     pub description: Option<String>,
     /// The hosted checkout page: send the payer here.
     pub url: String,
+    /// The product the session was started from, if any.
+    #[serde(default)]
+    pub product_id: Option<String>,
     #[serde(default)]
     pub success_url: Option<String>,
     #[serde(default)]
@@ -417,6 +420,142 @@ pub struct ListCheckoutSessionsResponse {
     pub sessions: Vec<CheckoutSession>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+/// Parameters for [`crate::CheckoutProducts::create`] (`POST /v1/checkout/products`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCheckoutProductParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merchant_name: Option<String>,
+    /// Price, integer string in base units of the settlement token (49 USDC = `"49000000"`).
+    pub amount: String,
+    /// Settlement chain id or slug: ethereum, arbitrum, base, optimism, bsc, polygon or solana.
+    pub settle_chain: String,
+    /// `"USDC"` or `"USDT"` (or its address) on that chain.
+    pub settle_token: String,
+    /// Your payout address on the settlement chain.
+    pub recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_url: Option<String>,
+    /// Lifetime of each session started from the product: 5–10080, default 60.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_minutes: Option<u32>,
+    /// https origins allowed to start sessions from a browser; empty = any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_origins: Option<Vec<String>>,
+    /// Defaults to `true` on the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+}
+
+/// Parameters for [`crate::CheckoutProducts::update`] (`PATCH /v1/checkout/products/{id}`).
+/// Only `Some` fields are sent; `Some(None)` on a nullable field sends `null` to clear it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheckoutProductParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merchant_name: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settle_chain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settle_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_url: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_url: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in_minutes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_origins: Option<Vec<String>>,
+    /// `Some(false)` stops new sessions; existing sessions keep their terms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+}
+
+/// A product (`object: "checkout.product"`): a fixed price for payment buttons,
+/// `layerhop.com/buy/{id}` links and store plugins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutProduct {
+    pub id: String,
+    pub object: String,
+    pub livemode: bool,
+    pub active: bool,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub merchant_name: Option<String>,
+    /// Price, base units of the settlement token.
+    pub amount: String,
+    pub settlement: CheckoutSettlement,
+    /// `https://layerhop.com/buy/{id}`: starts a session and opens the payment page.
+    pub url: String,
+    /// Owner only (with the account's API key).
+    #[serde(default)]
+    pub recipient: Option<String>,
+    /// Owner only.
+    #[serde(default)]
+    pub success_url: Option<String>,
+    /// Owner only.
+    #[serde(default)]
+    pub cancel_url: Option<String>,
+    /// Owner only.
+    #[serde(default)]
+    pub expires_in_minutes: Option<u32>,
+    /// Owner only.
+    #[serde(default)]
+    pub allowed_origins: Option<Vec<String>>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// Parameters for [`crate::CheckoutProducts::list`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListCheckoutProductsParams {
+    /// Filter by state when set.
+    pub active: Option<bool>,
+    pub cursor: Option<String>,
+    /// 1–100, default 50.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListCheckoutProductsResponse {
+    #[serde(default)]
+    pub products: Vec<CheckoutProduct>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Parameters for [`crate::CheckoutProducts::start_session`]: the only things a caller may add to
+/// the product's terms.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartProductCheckoutParams {
+    /// Your order id, returned in the session and its webhooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// Up to 10 string values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BTreeMap<String, String>>,
 }
 
 /// Parameters for [`crate::Checkout::quote`].

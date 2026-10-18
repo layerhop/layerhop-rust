@@ -104,6 +104,11 @@ async fn main() -> layerhop::Result<()> {
 | `checkout().expire(id)` | `POST /v1/checkout/sessions/{id}/expire` |
 | `checkout().quote(id, &CheckoutQuoteParams)` | `POST /v1/checkout/sessions/{id}/quote` (public) |
 | `checkout().stream(id)` | `GET /v1/checkout/sessions/{id}/events` (SSE, public) |
+| `checkout().products().create(&CreateCheckoutProductParams)` | `POST /v1/checkout/products` |
+| `checkout().products().list(&ListCheckoutProductsParams)` | `GET /v1/checkout/products?active=&cursor=&limit=` |
+| `checkout().products().get(id)` | `GET /v1/checkout/products/{id}` (public) |
+| `checkout().products().update(id, &UpdateCheckoutProductParams)` | `PATCH /v1/checkout/products/{id}` (only `Some` fields) |
+| `checkout().products().start_session(id, &StartProductCheckoutParams)` | `POST /v1/checkout/products/{id}/sessions` (public) |
 | `webhooks().stream()` | `GET /v1/webhooks/stream` (SSE, API key) |
 | `webhooks().trigger(event_type)` | `POST /v1/webhooks/trigger` (test keys only) |
 
@@ -178,6 +183,50 @@ let tx = lh.build_tx(&q.best.quote_id).await?;
 
 `checkout().list(..)` pages through your sessions and `checkout().expire(id)` cancels an open one.
 See the [checkout guide](https://docs.layerhop.com/guides/checkout).
+
+## Products and payment buttons
+
+A product is a fixed price (amount, settlement token, payout address and redirect URLs) that
+anyone may start a session from without being able to change it: the backing for payment buttons,
+`https://layerhop.com/buy/{id}` links and store plugins. `create`, `list` and `update` need your
+API key; `get` and `start_session` are public.
+
+```rust
+use layerhop::{CreateCheckoutProductParams, StartProductCheckoutParams, UpdateCheckoutProductParams};
+
+let product = lh
+    .checkout()
+    .products()
+    .create(&CreateCheckoutProductParams {
+        name: "Pro plan".into(),
+        description: Some("1 month".into()),
+        amount: "49000000".into(), // 49 USDC
+        settle_chain: "base".into(),
+        settle_token: "USDC".into(),
+        recipient: "0xYourPayoutAddress".into(),
+        success_url: Some("https://shop.example.com/thanks".into()),
+        allowed_origins: Some(vec!["https://shop.example.com".into()]),
+        ..Default::default()
+    })
+    .await?;
+println!("{}", product.url); // https://layerhop.com/buy/prod_...: share it or put it behind a button
+
+// Only `Some` fields change; `Some(None)` clears a nullable field such as `description`.
+lh.checkout()
+    .products()
+    .update(&product.id, &UpdateCheckoutProductParams { active: Some(false), ..Default::default() })
+    .await?; // stops new sessions
+
+// Public (no key): start a session on the product's terms, adding only your order id.
+let session = LayerHop::new()
+    .checkout()
+    .products()
+    .start_session(&product.id, &StartProductCheckoutParams { reference: Some("order_1042".into()), ..Default::default() })
+    .await?;
+println!("{} {:?}", session.url, session.product_id);
+```
+
+See the [payment buttons guide](https://docs.layerhop.com/guides/payment-buttons).
 
 ## Test mode
 
