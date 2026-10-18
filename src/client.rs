@@ -416,6 +416,60 @@ impl Checkout<'_> {
     pub fn stream(&self, id: &str) -> impl Stream<Item = Result<CheckoutSession>> + Send + 'static {
         self.client.sse(format!("/checkout/sessions/{}/events", urlencoding::encode(id)), "session")
     }
+
+    /// Products: a fixed price for payment buttons, `layerhop.com/buy/{id}` links and plugins.
+    /// `create`, `list` and `update` need an API key; `get` and `start_session` are public.
+    pub fn products(&self) -> CheckoutProducts<'_> {
+        CheckoutProducts { client: self.client }
+    }
+}
+
+/// Checkout product endpoints, from [`Checkout::products`].
+#[derive(Debug, Clone, Copy)]
+pub struct CheckoutProducts<'a> {
+    client: &'a LayerHop,
+}
+
+impl CheckoutProducts<'_> {
+    /// `POST /v1/checkout/products` — create a product; share its `url` or put it behind a button.
+    pub async fn create(&self, p: &CreateCheckoutProductParams) -> Result<CheckoutProduct> {
+        self.client.call(Method::POST, "/checkout/products", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `GET /v1/checkout/products/{id}` — public: name, price and settlement; every field with the
+    /// owner's key.
+    pub async fn get(&self, id: &str) -> Result<CheckoutProduct> {
+        let path = format!("/checkout/products/{}", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+
+    /// `GET /v1/checkout/products` — your products of the key's mode (live or test).
+    pub async fn list(&self, p: &ListCheckoutProductsParams) -> Result<ListCheckoutProductsResponse> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = p.active {
+            q.push(("active", v.to_string()));
+        }
+        if let Some(v) = &p.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        self.client.call(Method::GET, "/checkout/products", &q, None).await
+    }
+
+    /// `PATCH /v1/checkout/products/{id}` — change only the fields that are `Some`.
+    pub async fn update(&self, id: &str, p: &UpdateCheckoutProductParams) -> Result<CheckoutProduct> {
+        let path = format!("/checkout/products/{}", urlencoding::encode(id));
+        self.client.call(Method::PATCH, &path, &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `POST /v1/checkout/products/{id}/sessions` — public: start a session on the product's terms
+    /// (`CONFLICT` if inactive). Send the payer to its `url`.
+    pub async fn start_session(&self, id: &str, p: &StartProductCheckoutParams) -> Result<CheckoutSession> {
+        let path = format!("/checkout/products/{}/sessions", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(serde_json::to_value(p)?)).await
+    }
 }
 
 /// Webhook developer tools, from [`LayerHop::webhooks`]. Both need an API key.
