@@ -269,6 +269,13 @@ impl LayerHop {
         self.call(Method::GET, "/orders", &q, None).await
     }
 
+    /// Checkout ("pay with any token"). `create`, `list` and `expire` need an API key; `get` and
+    /// `quote` are public (the payer's side). Pay a quote with [`LayerHop::build_tx`] +
+    /// [`LayerHop::report_submitted`] as usual.
+    pub fn checkout(&self) -> Checkout<'_> {
+        Checkout { client: self }
+    }
+
     /// Poll [`LayerHop::status`] until the order is final (`filled` / `refunded` / `failed`),
     /// yielding each state change. Yields [`Error::Timeout`] (then ends) after `opts.timeout`,
     /// and ends after the first request error.
@@ -331,5 +338,52 @@ impl LayerHop {
                 }
             }
         })
+    }
+}
+
+/// Checkout session endpoints, from [`LayerHop::checkout`].
+#[derive(Debug, Clone, Copy)]
+pub struct Checkout<'a> {
+    client: &'a LayerHop,
+}
+
+impl Checkout<'_> {
+    /// `POST /v1/checkout/sessions` — create a session; send the payer to its `url`.
+    pub async fn create(&self, p: &CreateCheckoutParams) -> Result<CheckoutSession> {
+        self.client.call(Method::POST, "/checkout/sessions", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `GET /v1/checkout/sessions/{id}` — public; `reference` and `metadata` need the owner's key.
+    pub async fn get(&self, id: &str) -> Result<CheckoutSession> {
+        let path = format!("/checkout/sessions/{}", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+
+    /// `GET /v1/checkout/sessions` — your sessions of the key's mode (live or test), newest first.
+    pub async fn list(&self, p: &ListCheckoutSessionsParams) -> Result<ListCheckoutSessionsResponse> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = &p.status {
+            q.push(("status", v.clone()));
+        }
+        if let Some(v) = &p.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        self.client.call(Method::GET, "/checkout/sessions", &q, None).await
+    }
+
+    /// `POST /v1/checkout/sessions/{id}/expire` — cancel an `open` session (`CONFLICT` otherwise).
+    pub async fn expire(&self, id: &str) -> Result<CheckoutSession> {
+        let path = format!("/checkout/sessions/{}/expire", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `POST /v1/checkout/sessions/{id}/quote` — public: price paying the session with
+    /// `src_token` on `src_chain` from `sender`.
+    pub async fn quote(&self, id: &str, p: &CheckoutQuoteParams) -> Result<CheckoutQuoteResponse> {
+        let path = format!("/checkout/sessions/{}/quote", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(serde_json::to_value(p)?)).await
     }
 }
