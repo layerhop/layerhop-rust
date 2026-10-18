@@ -35,10 +35,12 @@ mod error;
 mod models;
 pub mod webhook;
 
-pub use client::{LayerHop, LayerHopBuilder, WatchOptions, DEFAULT_BASE_URL};
+pub use client::{Checkout, LayerHop, LayerHopBuilder, WatchOptions, DEFAULT_BASE_URL};
 pub use error::{Error, Result};
 pub use models::{
-    Approval, BuiltTx, Chain, EvmTx, FeeBreakdown, HealthResponse, ListOrdersParams, ListOrdersResponse, Order,
+    Approval, BuiltTx, Chain, CheckoutPayment, CheckoutQuote, CheckoutQuoteParams, CheckoutQuoteResponse,
+    CheckoutSession, CheckoutSettlement, CreateCheckoutParams, EvmTx, FeeBreakdown, HealthResponse,
+    ListCheckoutSessionsParams, ListCheckoutSessionsResponse, ListOrdersParams, ListOrdersResponse, Order,
     OrderStatus, ProviderError, ProviderId, Quote, QuoteParams, QuoteResponse, ReportSubmittedResponse,
     SimulateError, SimulateResponse, SvmTx, Token,
 };

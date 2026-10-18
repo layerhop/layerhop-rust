@@ -97,9 +97,71 @@ async fn main() -> layerhop::Result<()> {
 | `status(provider, id)` | `GET /v1/orders/{provider}/{id}` |
 | `watch(provider, id, WatchOptions)` | polls `status` and yields a `Stream` of state changes |
 | `list_orders(&ListOrdersParams)` | `GET /v1/orders?address=&status=&cursor=&limit=` |
+| `checkout().create(&CreateCheckoutParams)` | `POST /v1/checkout/sessions` |
+| `checkout().list(&ListCheckoutSessionsParams)` | `GET /v1/checkout/sessions?status=&cursor=&limit=` |
+| `checkout().get(id)` | `GET /v1/checkout/sessions/{id}` (public) |
+| `checkout().expire(id)` | `POST /v1/checkout/sessions/{id}/expire` |
+| `checkout().quote(id, &CheckoutQuoteParams)` | `POST /v1/checkout/sessions/{id}/quote` (public) |
 
 Builder options: `base_url`, `api_key` (sent as `x-api-key`), `channel` (`api` by default),
 `integrator` (your partner id), `integrator_fee_bps`, `http_client` (your own `reqwest::Client`).
+
+## Checkout (pay with any token)
+
+Get paid in USDC or USDT on the chain you choose while your customer pays with any token on any
+chain. Create a session with your API key and send the customer to its hosted `url`. The session
+becomes `paid` (and a `checkout.session.completed` webhook fires) once the delivery is verified on
+chain.
+
+```rust
+use layerhop::{CheckoutQuoteParams, CreateCheckoutParams};
+
+let session = lh
+    .checkout()
+    .create(&CreateCheckoutParams {
+        amount: "49000000".into(), // 49 USDC (6 decimals)
+        settle_chain: "base".into(),
+        settle_token: "USDC".into(),
+        recipient: "0xYourPayoutAddress".into(),
+        description: Some("Pro plan, 1 month".into()),
+        reference: Some("order_1042".into()),
+        success_url: Some("https://shop.example.com/thanks".into()),
+        ..Default::default()
+    })
+    .await?;
+println!("{}", session.url); // redirect the customer here
+
+let s = lh.checkout().get(&session.id).await?; // s.status: open | processing | paid | expired | needs_review
+```
+
+To build your own payment page, `get` and `quote` are public (no key needed). Pay the chosen quote
+with `build_tx` and `report_submitted` as usual:
+
+```rust
+let q = lh
+    .checkout()
+    .quote(&session_id, &CheckoutQuoteParams {
+        src_chain: "arbitrum".into(),
+        src_token: "ETH".into(),
+        sender: payer_address.into(),
+        slippage_bps: None,
+    })
+    .await?;
+// q.best.src_amount is what the payer sends; q.best.dst_amount_min is at least the amount due.
+let tx = lh.build_tx(&q.best.quote_id).await?;
+```
+
+`checkout().list(..)` pages through your sessions and `checkout().expire(id)` cancels an open one.
+See the [checkout guide](https://docs.layerhop.com/guides/checkout).
+
+## Test mode
+
+Use an `lh_test_` key exactly like a live key. Every request is served by the `sandbox` provider,
+responses carry `livemode: false` (`QuoteResponse::livemode`, `Order::livemode`), and built
+transactions have `sandbox: Some(true)`. Never broadcast them; report any hash with
+`report_submitted`. The last digits of `amount` choose the outcome: `…4001` refunds, `…4002` fails
+and `…4004` returns `NO_ROUTE`. Checkout sessions created with a test key (`cs_test_…`) are paid
+through the sandbox too. See the [test mode guide](https://docs.layerhop.com/guides/test-mode).
 
 ## Errors
 
