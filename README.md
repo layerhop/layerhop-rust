@@ -1,5 +1,7 @@
 # layerhop (Rust)
 
+[![crates.io](https://img.shields.io/crates/v/layerhop?color=c3f06b&labelColor=090d15)](https://crates.io/crates/layerhop) [![docs.rs](https://img.shields.io/docsrs/layerhop?labelColor=090d15)](https://docs.rs/layerhop) [![license](https://img.shields.io/crates/l/layerhop?color=7ddec8&labelColor=090d15)](https://opensource.org/license/mit)
+
 Async Rust client for the [LayerHop](https://docs.layerhop.com) API: best-price cross-chain and
 same-chain swaps (EVM ↔ Solana) through one non-custodial API. It mirrors the TypeScript SDK
 (`@layerhop/sdk`).
@@ -17,7 +19,6 @@ cargo add tokio --features macros,rt-multi-thread
 cargo add futures-util   # for StreamExt in the watch example
 ```
 
-Inside the monorepo: `layerhop = { path = "sdks/rust" }`.
 
 ## Quickstart
 
@@ -129,7 +130,6 @@ webhook::verify(&secret, &raw_body, signature_header)?; // default 300 s toleran
 ## Development
 
 ```bash
-cd sdks/rust
 cargo test
 ```
 
