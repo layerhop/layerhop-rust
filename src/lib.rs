@@ -35,14 +35,14 @@ mod error;
 mod models;
 pub mod webhook;
 
-pub use client::{Checkout, LayerHop, LayerHopBuilder, WatchOptions, DEFAULT_BASE_URL};
+pub use client::{Checkout, LayerHop, LayerHopBuilder, WatchOptions, Webhooks, DEFAULT_BASE_URL};
 pub use error::{Error, Result};
 pub use models::{
     Approval, BuiltTx, Chain, CheckoutPayment, CheckoutQuote, CheckoutQuoteParams, CheckoutQuoteResponse,
     CheckoutSession, CheckoutSettlement, CreateCheckoutParams, EvmTx, FeeBreakdown, HealthResponse,
     ListCheckoutSessionsParams, ListCheckoutSessionsResponse, ListOrdersParams, ListOrdersResponse, Order,
     OrderStatus, ProviderError, ProviderId, Quote, QuoteParams, QuoteResponse, ReportSubmittedResponse,
-    SimulateError, SimulateResponse, SvmTx, Token,
+    SimulateError, SimulateResponse, SvmTx, Token, TriggerWebhookResponse, WebhookEvent, WebhookEventData,
 };
 
 /// LayerHop's internal chain id for Solana (EVM chains use their real chain id).

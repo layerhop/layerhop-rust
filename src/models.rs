@@ -463,6 +463,46 @@ pub struct CheckoutQuoteResponse {
     pub errors: Vec<ProviderError>,
 }
 
+/// The JSON body LayerHop POSTs to your webhook endpoints, and what
+/// [`crate::Webhooks::stream`] yields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookEvent {
+    pub id: String,
+    /// `order.submitted` · `order.filled` · `order.refunded` · `order.failed` ·
+    /// `checkout.session.processing` · `checkout.session.completed` ·
+    /// `checkout.session.payment_failed` · `checkout.session.expired` (or `webhook.test`).
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub livemode: bool,
+    /// `Some(true)` on samples from the dashboard or [`crate::Webhooks::trigger`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<bool>,
+    pub created_at: String,
+    #[serde(default)]
+    pub data: WebhookEventData,
+}
+
+/// The object a [`WebhookEvent`] is about: `order` for `order.*` events, `session` for
+/// `checkout.session.*` events.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WebhookEventData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<CheckoutSession>,
+}
+
+/// Response of [`crate::Webhooks::trigger`] (`POST /v1/webhooks/trigger`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerWebhookResponse {
+    pub event_id: String,
+    /// Test endpoints the event was queued for.
+    pub deliveries: u32,
+    pub payload: WebhookEvent,
+}
+
 /// Accepts `"21000"` or `21000` and yields `Some("21000")`.
 fn string_or_number<'de, D>(d: D) -> Result<Option<String>, D::Error>
 where
