@@ -22,4 +22,4 @@ should run locally before opening a PR.
 
 ## Releases
 
-Bump `version` in `Cargo.toml`, then push a `vX.Y.Z` tag. `.github/workflows/release.yml` runs the tests and `cargo publish` (requires the `CARGO_REGISTRY_TOKEN` repository secret). Local dev: `cargo test && cargo clippy --all-targets -- -D warnings`.
+Bump `version` in `Cargo.toml`, then push a `vX.Y.Z` tag. `.github/workflows/release.yml` runs the tests and `cargo publish` (requires the `CARGO_REGISTRY_TOKEN` repository secret); versions already on crates.io are skipped. Local dev: `cargo test && cargo clippy --all-targets -- -D warnings`.
