@@ -35,17 +35,23 @@ mod error;
 mod models;
 pub mod webhook;
 
-pub use client::{Checkout, CheckoutProducts, LayerHop, LayerHopBuilder, WatchOptions, Webhooks, DEFAULT_BASE_URL};
+pub use client::{
+    Checkout, CheckoutProducts, CheckoutRefunds, Invoices, LayerHop, LayerHopBuilder, WatchOptions, Webhooks,
+    DEFAULT_BASE_URL,
+};
 pub use error::{Error, Result};
 pub use models::{
     Approval, BuiltTx, Chain, CheckoutPayment, CheckoutProduct, CheckoutQuote, CheckoutQuoteParams,
     CheckoutQuoteResponse, CheckoutSession, CheckoutSettlement, CreateCheckoutParams, CreateCheckoutProductParams,
-    EvmTx, FeeBreakdown, HealthResponse, ListCheckoutProductsParams, ListCheckoutProductsResponse,
-    ListCheckoutSessionsParams, ListCheckoutSessionsResponse, ListOrdersParams, ListOrdersResponse, Order,
-    OrderStatus, ProviderError, ProviderId, Quote, QuoteParams, QuoteResponse, ReportSubmittedResponse,
-    SimulateError, SimulateResponse, StartProductCheckoutParams, SvmTx, Token, TriggerWebhookResponse,
-    UpdateCheckoutProductParams, WebhookEvent, WebhookEventData,
+    CreateInvoiceParams, CreateRefundParams, CreateRefundResponse, EvmTx, FeeBreakdown, HealthResponse, Invoice,
+    InvoiceLineItem, ListCheckoutProductsParams, ListCheckoutProductsResponse, ListCheckoutSessionsParams,
+    ListCheckoutSessionsResponse, ListInvoicesParams, ListInvoicesResponse, ListOrdersParams, ListOrdersResponse,
+    ListRefundsResponse, Order, OrderStatus, PayInvoiceResponse, ProviderError, ProviderId, Quote, QuoteParams,
+    QuoteResponse, Refund, RefundDestination, RefundQuote, ReportSubmittedResponse, SimulateError, SimulateResponse,
+    StartProductCheckoutParams, StatusComponent, StatusDay, StatusIncident, StatusResponse, SvmTx, Token,
+    TriggerWebhookResponse, UpdateCheckoutProductParams, UpdateInvoiceParams, WebhookEvent, WebhookEventData,
 };
+
 
 /// LayerHop's internal chain id for Solana (EVM chains use their real chain id).
 pub const SOLANA_CHAIN_ID: u64 = 7565164;

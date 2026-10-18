@@ -109,6 +109,17 @@ async fn main() -> layerhop::Result<()> {
 | `checkout().products().get(id)` | `GET /v1/checkout/products/{id}` (public) |
 | `checkout().products().update(id, &UpdateCheckoutProductParams)` | `PATCH /v1/checkout/products/{id}` (only `Some` fields) |
 | `checkout().products().start_session(id, &StartProductCheckoutParams)` | `POST /v1/checkout/products/{id}/sessions` (public) |
+| `checkout().refunds().create(session_id, &CreateRefundParams)` | `POST /v1/checkout/sessions/{id}/refunds` |
+| `checkout().refunds().list(session_id)` | `GET /v1/checkout/sessions/{id}/refunds` |
+| `invoices().create(&CreateInvoiceParams)` | `POST /v1/invoices` |
+| `invoices().list(&ListInvoicesParams)` | `GET /v1/invoices?status=&cursor=&limit=` |
+| `invoices().get(id)` | `GET /v1/invoices/{id}` |
+| `invoices().update(id, &UpdateInvoiceParams)` | `PATCH /v1/invoices/{id}` (drafts only, only `Some` fields) |
+| `invoices().send(id)` | `POST /v1/invoices/{id}/send` |
+| `invoices().void(id)` | `POST /v1/invoices/{id}/void` |
+| `invoices().public_view(id)` | `GET /v1/invoices/{id}/public` (public) |
+| `invoices().pay(id)` | `POST /v1/invoices/{id}/pay` (public) |
+| `service_status()` | `GET /v1/status` (public) |
 | `webhooks().stream()` | `GET /v1/webhooks/stream` (SSE, API key) |
 | `webhooks().trigger(event_type)` | `POST /v1/webhooks/trigger` (test keys only) |
 
@@ -227,6 +238,94 @@ println!("{} {:?}", session.url, session.product_id);
 ```
 
 See the [payment buttons guide](https://docs.layerhop.com/guides/payment-buttons).
+
+## Invoices
+
+Bill a customer by email: line items, a due date and a memo, paid through checkout with any
+token. `send` (or `send: Some(true)` on create) finalizes the draft and emails the hosted page
+`https://layerhop.com/invoice/{id}`. Once paid, the invoice is `paid`, the customer gets a receipt
+with a PDF link (`receipt_url`) and an `invoice.paid` webhook fires.
+
+```rust
+use layerhop::{CreateInvoiceParams, InvoiceLineItem, UpdateInvoiceParams};
+
+let inv = lh
+    .invoices()
+    .create(&CreateInvoiceParams {
+        customer_email: Some("jane@example.com".into()),
+        customer_name: Some("Jane Doe".into()),
+        line_items: vec![InvoiceLineItem {
+            description: "Design work".into(),
+            quantity: 2,
+            unit_amount: "100000000".into(), // 100 USDC each
+        }],
+        settle_chain: "base".into(),
+        settle_token: "USDC".into(),
+        recipient: "0xYourPayoutAddress".into(),
+        due_at: Some("2026-11-01".into()),
+        send: Some(true), // email it now; omit to keep a draft
+        ..Default::default()
+    })
+    .await?;
+println!("{} {} {:?}", inv.number, inv.status, inv.url); // INV-0001 open Some("https://layerhop.com/invoice/inv_...")
+
+// Drafts can be edited (`Some(None)` clears a field); open ones can be re-sent or voided.
+lh.invoices()
+    .update(&draft_id, &UpdateInvoiceParams { memo: Some(Some("Net 14".into())), ..Default::default() })
+    .await?;
+lh.invoices().send(&draft_id).await?;
+lh.invoices().void(&inv.id).await?;
+
+// Public (no key): the customer's side.
+let pay = LayerHop::new().invoices().pay(&inv.id).await?; // send the payer to pay.url
+```
+
+Statuses: `draft` → `open` → `paid`, or `void`. See the
+[invoices guide](https://docs.layerhop.com/guides/invoices).
+
+## Refunds
+
+Refunds are non-custodial: you sign them from your own wallet (by default the session's payout
+address). LayerHop routes the settlement token back to the payer's original chain and token
+(`to: "original"`, the default) or sends the settlement token itself (`to: "settlement"`). Leave
+`amount` unset to refund everything not yet refunded.
+
+```rust
+use layerhop::CreateRefundParams;
+
+let r = lh
+    .checkout()
+    .refunds()
+    .create(&session_id, &CreateRefundParams {
+        amount: Some("10000000".into()), // 10 USDC of the 49 paid
+        reason: Some("Damaged item".into()),
+        ..Default::default()
+    })
+    .await?;
+// 1. build, 2. sign from r.quote.from with your wallet, 3. report the hash
+let tx = lh.build_tx(&r.quote.quote_id).await?;
+// ... sign and broadcast tx ...
+lh.report_submitted(&r.quote.quote_id, &tx_hash).await?;
+
+let refunds = lh.checkout().refunds().list(&session_id).await?; // pending → submitted → completed | failed
+```
+
+When the refund order fills, the refund is `completed`, the session's `refunded_amount` grows and
+a `checkout.session.refunded` webhook fires (with `data.session` and `data.refund`). See the
+[refunds guide](https://docs.layerhop.com/guides/refunds).
+
+## Service status
+
+`service_status()` returns the data behind [status.layerhop.com](https://status.layerhop.com): the
+overall `status` (`operational`, `degraded` or `outage`), every component with its 90-day uptime,
+and incidents from the last 14 days. It is public. (`status(provider, id)` tracks one order.)
+
+```rust
+let st = lh.service_status().await?;
+for c in &st.components {
+    println!("{} {}", c.name, c.status);
+}
+```
 
 ## Test mode
 
