@@ -1,6 +1,6 @@
 # layerhop (Rust)
 
-[![crates.io](https://img.shields.io/crates/v/layerhop?color=c3f06b&labelColor=090d15)](https://crates.io/crates/layerhop) [![docs.rs](https://img.shields.io/docsrs/layerhop?labelColor=090d15)](https://docs.rs/layerhop) [![license](https://img.shields.io/crates/l/layerhop?color=7ddec8&labelColor=090d15)](https://opensource.org/license/mit)
+[![crates.io](https://img.shields.io/crates/v/layerhop?color=c3f06b&labelColor=090d15&cacheSeconds=3600)](https://crates.io/crates/layerhop) [![docs.rs](https://img.shields.io/docsrs/layerhop?labelColor=090d15)](https://docs.rs/layerhop) [![license](https://img.shields.io/crates/l/layerhop?color=7ddec8&labelColor=090d15)](https://opensource.org/license/mit)
 
 Async Rust client for the [LayerHop](https://docs.layerhop.com) API: best-price cross-chain and
 same-chain swaps (EVM ↔ Solana) through one non-custodial API. It mirrors the TypeScript SDK
