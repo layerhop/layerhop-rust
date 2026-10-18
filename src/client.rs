@@ -1,6 +1,8 @@
+use std::pin::Pin;
 use std::time::Duration;
 
-use futures_util::stream::{self, Stream};
+use futures_util::future::{self, Either};
+use futures_util::stream::{self, Stream, StreamExt};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -147,29 +149,39 @@ impl LayerHop {
             req = req.json(&b);
         }
         let res = req.send().await?;
-        let status = res.status();
-        let header_request_id = res
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let bytes = res.bytes().await?;
-        if !status.is_success() {
-            let parsed = serde_json::from_slice::<ErrorEnvelope>(&bytes).ok().and_then(|e| e.error);
-            let (code, message, request_id) = match parsed {
-                Some(e) => (e.code, e.message, e.request_id),
-                None => (None, None, None),
-            };
-            return Err(Error::Api {
-                code: code.unwrap_or_else(|| "INTERNAL".to_string()),
-                message: message.unwrap_or_else(|| {
-                    status.canonical_reason().unwrap_or("request failed").to_string()
-                }),
-                status: status.as_u16(),
-                request_id: request_id.or(header_request_id),
-            });
+        if !res.status().is_success() {
+            return Err(api_error(res).await);
         }
+        let bytes = res.bytes().await?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Open a Server-Sent Events stream and yield the JSON data of its `event` frames. The request
+    /// is sent when the stream is first polled; dropping the stream closes the connection.
+    fn sse<T: DeserializeOwned + Send + 'static>(
+        &self,
+        path: String,
+        event: &'static str,
+    ) -> impl Stream<Item = Result<T>> + Send + 'static {
+        let client = self.clone();
+        let open = async move {
+            let mut req = client
+                .http
+                .get(format!("{}/v1{}", client.base_url, path))
+                .header("accept", "text/event-stream");
+            if let Some(key) = &client.api_key {
+                req = req.header("x-api-key", key);
+            }
+            let res = req.send().await?;
+            if !res.status().is_success() {
+                return Err(api_error(res).await);
+            }
+            Ok(res)
+        };
+        stream::once(open).flat_map(move |res| match res {
+            Ok(res) => Either::Left(parse_sse::<T, _, _>(res.bytes_stream(), event)),
+            Err(e) => Either::Right(stream::once(future::ready(Err(e)))),
+        })
     }
 
     /// `GET /v1/health`.
@@ -274,6 +286,18 @@ impl LayerHop {
     /// [`LayerHop::report_submitted`] as usual.
     pub fn checkout(&self) -> Checkout<'_> {
         Checkout { client: self }
+    }
+
+    /// `GET /v1/orders/{quoteId}/events` — live order status (Server-Sent Events). Yields the order
+    /// now and on every change, and ends when it is final (filled, refunded, failed or expired).
+    /// Drop the stream to stop early. A missing order yields one `ORDER_NOT_FOUND` [`Error::Api`].
+    pub fn stream_order(&self, quote_id: &str) -> impl Stream<Item = Result<Order>> + Send + 'static {
+        self.sse(format!("/orders/{}/events", urlencoding::encode(quote_id)), "order")
+    }
+
+    /// Webhook developer tools with an API key (the CLI's `listen` and `trigger`).
+    pub fn webhooks(&self) -> Webhooks<'_> {
+        Webhooks { client: self }
     }
 
     /// Poll [`LayerHop::status`] until the order is final (`filled` / `refunded` / `failed`),
@@ -385,5 +409,181 @@ impl Checkout<'_> {
     pub async fn quote(&self, id: &str, p: &CheckoutQuoteParams) -> Result<CheckoutQuoteResponse> {
         let path = format!("/checkout/sessions/{}/quote", urlencoding::encode(id));
         self.client.call(Method::POST, &path, &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `GET /v1/checkout/sessions/{id}/events` — public: live session status (Server-Sent Events).
+    /// Yields the session now and on every change until it is `paid`, `expired` or `needs_review`.
+    pub fn stream(&self, id: &str) -> impl Stream<Item = Result<CheckoutSession>> + Send + 'static {
+        self.client.sse(format!("/checkout/sessions/{}/events", urlencoding::encode(id)), "session")
+    }
+}
+
+/// Webhook developer tools, from [`LayerHop::webhooks`]. Both need an API key.
+#[derive(Debug, Clone, Copy)]
+pub struct Webhooks<'a> {
+    client: &'a LayerHop,
+}
+
+impl Webhooks<'_> {
+    /// `GET /v1/webhooks/stream` — your account's webhook events of the key's mode (live or test)
+    /// as they are created, with the exact payloads your endpoints receive. The server closes the
+    /// stream after at most 30 minutes; open a new one to continue.
+    pub fn stream(&self) -> impl Stream<Item = Result<WebhookEvent>> + Send + 'static {
+        self.client.sse("/webhooks/stream".to_string(), "event")
+    }
+
+    /// `POST /v1/webhooks/trigger` — a sample event of `event_type` (e.g. `order.filled`) in test
+    /// mode, sent to your test endpoints and open streams. Test keys only (`FORBIDDEN` otherwise).
+    pub async fn trigger(&self, event_type: &str) -> Result<TriggerWebhookResponse> {
+        self.client
+            .call(Method::POST, "/webhooks/trigger", &[], Some(json!({ "type": event_type })))
+            .await
+    }
+}
+
+/// Build an [`Error::Api`] from a non-2xx response (JSON error body, else the status text).
+async fn api_error(res: reqwest::Response) -> Error {
+    let status = res.status();
+    let header_request_id = res
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = match res.bytes().await {
+        Ok(b) => b,
+        Err(e) => return Error::Http(e),
+    };
+    let parsed = serde_json::from_slice::<ErrorEnvelope>(&bytes).ok().and_then(|e| e.error);
+    let (code, message, request_id) = match parsed {
+        Some(e) => (e.code, e.message, e.request_id),
+        None => (None, None, None),
+    };
+    Error::Api {
+        code: code.unwrap_or_else(|| "INTERNAL".to_string()),
+        message: message
+            .unwrap_or_else(|| status.canonical_reason().unwrap_or("request failed").to_string()),
+        status: status.as_u16(),
+        request_id: request_id.or(header_request_id),
+    }
+}
+
+/// Incremental Server-Sent Events parser: one line (without its terminator) at a time.
+struct SseParser {
+    event: &'static str,
+    name: String,
+    data: Vec<String>,
+}
+
+impl SseParser {
+    fn new(event: &'static str) -> Self {
+        Self { event, name: "message".to_string(), data: Vec::new() }
+    }
+
+    /// The joined `data` of a completed frame named `event`. Comments (`:`) and other frames
+    /// (`ready`) are skipped.
+    fn line(&mut self, line: &str) -> Option<String> {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            let name = std::mem::replace(&mut self.name, "message".to_string());
+            let data = std::mem::take(&mut self.data);
+            return (name == self.event && !data.is_empty()).then(|| data.join("\n"));
+        }
+        if let Some(v) = line.strip_prefix("event:") {
+            self.name = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("data:") {
+            self.data.push(v.strip_prefix(' ').unwrap_or(v).to_string());
+        }
+        None
+    }
+}
+
+/// Turn a response body into a stream of decoded `event` frames. Ends when the body ends (a
+/// partial trailing frame is dropped) or after the first error.
+fn parse_sse<T, S, B>(body: S, event: &'static str) -> impl Stream<Item = Result<T>> + Send + 'static
+where
+    T: DeserializeOwned + Send + 'static,
+    S: Stream<Item = reqwest::Result<B>> + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+{
+    struct State<S> {
+        body: Pin<Box<S>>,
+        buf: Vec<u8>,
+        parser: SseParser,
+        done: bool,
+    }
+    let init = State { body: Box::pin(body), buf: Vec::new(), parser: SseParser::new(event), done: false };
+    stream::unfold(init, |mut st| async move {
+        if st.done {
+            return None;
+        }
+        loop {
+            while let Some(pos) = st.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = st.buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line[..pos]);
+                if let Some(data) = st.parser.line(&line) {
+                    return match serde_json::from_str::<T>(&data) {
+                        Ok(v) => Some((Ok(v), st)),
+                        Err(e) => {
+                            st.done = true;
+                            Some((Err(Error::Decode(e)), st))
+                        }
+                    };
+                }
+            }
+            match st.body.next().await {
+                Some(Ok(chunk)) => st.buf.extend_from_slice(chunk.as_ref()),
+                Some(Err(e)) => {
+                    st.done = true;
+                    return Some((Err(Error::Http(e)), st));
+                }
+                None => return None,
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Ev {
+        n: u32,
+        s: Option<String>,
+    }
+
+    fn body(chunks: &[&'static str]) -> impl Stream<Item = reqwest::Result<&'static [u8]>> + Send + 'static {
+        stream::iter(chunks.iter().map(|c| Ok(c.as_bytes())).collect::<Vec<_>>())
+    }
+
+    #[tokio::test]
+    async fn parses_frames_split_across_chunks() {
+        let chunks = [
+            ": connected\r\n\r\nevent: ready\r\ndata: {}\r\n\r\nevent: order\r\ndata: {\"n\":",
+            "1}\r\n\r",
+            "\n: ping\n\nevent: other\ndata: {\"n\":9}\n\nevent: order\ndata: {\"n\":2,\ndata: \"s\":\"a\\nb\"}\n",
+            "\nevent: order\ndata: {\"n\":3}\n", // no blank line: incomplete, dropped
+        ];
+        let got: Vec<Ev> = parse_sse::<Ev, _, _>(body(&chunks), "order").map(|r| r.unwrap()).collect().await;
+        assert_eq!(got, vec![Ev { n: 1, s: None }, Ev { n: 2, s: Some("a\nb".into()) }]);
+    }
+
+    #[tokio::test]
+    async fn bad_json_yields_one_decode_error() {
+        let items: Vec<Result<Ev>> =
+            parse_sse(body(&["event: order\ndata: {nope\n\nevent: order\ndata: {\"n\":1}\n\n"]), "order").collect().await;
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Err(Error::Decode(_))));
+    }
+
+    #[test]
+    fn parser_handles_data_prefix_variants() {
+        let mut p = SseParser::new("event");
+        assert_eq!(p.line("event:event"), None);
+        assert_eq!(p.line("data:x"), None);
+        assert_eq!(p.line("data:  y"), None);
+        assert_eq!(p.line(""), Some("x\n y".to_string()));
+        assert_eq!(p.line("data: z"), None);
+        assert_eq!(p.line("\r"), None); // a frame with the default name "message" is ignored
     }
 }

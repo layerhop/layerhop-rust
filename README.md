@@ -16,7 +16,7 @@ same-chain swaps (EVM ↔ Solana) through one non-custodial API. It mirrors the 
 ```bash
 cargo add layerhop
 cargo add tokio --features macros,rt-multi-thread
-cargo add futures-util   # for StreamExt in the watch example
+cargo add futures-util   # for StreamExt in the watch and stream examples
 ```
 
 
@@ -96,15 +96,40 @@ async fn main() -> layerhop::Result<()> {
 | `simulate(quote_id)` | `POST /v1/simulate` |
 | `status(provider, id)` | `GET /v1/orders/{provider}/{id}` |
 | `watch(provider, id, WatchOptions)` | polls `status` and yields a `Stream` of state changes |
+| `stream_order(quote_id)` | `GET /v1/orders/{quoteId}/events` (SSE), a `Stream` of `Order` until final |
 | `list_orders(&ListOrdersParams)` | `GET /v1/orders?address=&status=&cursor=&limit=` |
 | `checkout().create(&CreateCheckoutParams)` | `POST /v1/checkout/sessions` |
 | `checkout().list(&ListCheckoutSessionsParams)` | `GET /v1/checkout/sessions?status=&cursor=&limit=` |
 | `checkout().get(id)` | `GET /v1/checkout/sessions/{id}` (public) |
 | `checkout().expire(id)` | `POST /v1/checkout/sessions/{id}/expire` |
 | `checkout().quote(id, &CheckoutQuoteParams)` | `POST /v1/checkout/sessions/{id}/quote` (public) |
+| `checkout().stream(id)` | `GET /v1/checkout/sessions/{id}/events` (SSE, public) |
+| `webhooks().stream()` | `GET /v1/webhooks/stream` (SSE, API key) |
+| `webhooks().trigger(event_type)` | `POST /v1/webhooks/trigger` (test keys only) |
 
 Builder options: `base_url`, `api_key` (sent as `x-api-key`), `channel` (`api` by default),
 `integrator` (your partner id), `integrator_fee_bps`, `http_client` (your own `reqwest::Client`).
+
+## Live order status
+
+`stream_order` follows an order over Server-Sent Events instead of polling: a `Stream` that yields
+the order now and on every change, and ends once it is final (`filled`, `refunded`, `failed` or
+`expired`). `checkout().stream(id)` does the same for a checkout session (until `paid`, `expired`
+or `needs_review`).
+
+```rust
+use futures_util::StreamExt;
+
+let mut orders = Box::pin(lh.stream_order(&quote_id));
+while let Some(order) = orders.next().await {
+    let order = order?; // Error::Api (ORDER_NOT_FOUND), Error::Http or Error::Decode, then the stream ends
+    println!("{:?} {:?}", order.status, order.dst_tx_hash);
+}
+```
+
+The request is sent on the first poll; drop the stream to close the connection. A client-wide
+`reqwest` timeout also cuts streams, so leave it unset on a client used for them. Guide:
+https://docs.layerhop.com/guides/live-status
 
 ## Checkout (pay with any token)
 
@@ -187,6 +212,22 @@ use layerhop::webhook;
 
 webhook::verify(&secret, &raw_body, signature_header)?; // default 300 s tolerance
 // or: webhook::verify_signature(&secret, &raw_body, header, tolerance, std::time::SystemTime::now())
+```
+
+### Webhook tools
+
+With an API key, `webhooks().stream()` yields your account's webhook events (in the key's live or
+test mode) as `WebhookEvent`s as they are created. `webhooks().trigger(event_type)` creates a
+sample event in test mode (test keys only; a live key returns `Error::Api` with `FORBIDDEN`).
+
+```rust
+let lh = LayerHop::builder().api_key("lh_test_...").build();
+let r = lh.webhooks().trigger("order.filled").await?; // r.event_id, r.deliveries, r.payload
+let mut events = Box::pin(lh.webhooks().stream());
+while let Some(event) = events.next().await {
+    let event = event?;
+    println!("{} {:?}", event.event_type, event.data.order);
+}
 ```
 
 ## Development
