@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use layerhop::{BuiltTx, Error, LayerHop, ListOrdersParams, QuoteParams, WatchOptions};
+use layerhop::{BuiltTx, Error, GasOnArrivalRequest, LayerHop, ListOrdersParams, Order, QuoteParams, WatchOptions};
 use serde_json::json;
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn client(server: &MockServer) -> LayerHop {
@@ -28,6 +28,7 @@ fn params() -> QuoteParams {
         sender: "0x1111111111111111111111111111111111111111".into(),
         recipient: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".into(),
         slippage_bps: None,
+        gas_on_arrival: None,
     }
 }
 
@@ -111,6 +112,65 @@ async fn quote_sends_all_params() {
     assert_eq!(r.best.fees.gas_usd, Some(0.03));
     assert_eq!(r.quotes.len(), 2);
     assert_eq!(r.errors[0].code, "PROVIDER_TIMEOUT");
+}
+
+#[tokio::test]
+async fn quote_gas_on_arrival() {
+    let server = MockServer::start().await;
+    let mut with_gas = quote_json("q_1", "relay", "612345678");
+    with_gas["gasOnArrival"] = json!({
+        "amount": "500000000000000", "token": "0x0000000000000000000000000000000000000000",
+        "symbol": "ETH", "decimals": 18, "usd": 2.01
+    });
+    let body = json!({ "best": with_gas.clone(), "quotes": [with_gas], "errors": [] });
+    Mock::given(method("GET"))
+        .and(path("/v1/quote"))
+        .and(query_param("gasOnArrival", "true"))
+        .and(query_param_is_missing("gasOnArrivalUsd"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/quote"))
+        .and(query_param("gasOnArrivalUsd", "5.5"))
+        .and(query_param_is_missing("gasOnArrival"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/quote"))
+        .and(query_param_is_missing("gasOnArrival"))
+        .and(query_param_is_missing("gasOnArrivalUsd"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "best": quote_json("q_2", "relay", "1"), "quotes": [quote_json("q_2", "relay", "1")], "errors": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let lh = client(&server);
+    let r = lh
+        .quote(&QuoteParams { gas_on_arrival: Some(GasOnArrivalRequest::Default), ..params() })
+        .await
+        .unwrap();
+    let g = r.best.gas_on_arrival.unwrap();
+    assert_eq!(g.amount, "500000000000000");
+    assert_eq!(g.symbol, "ETH");
+    assert_eq!(g.decimals, 18);
+    assert_eq!(g.usd, Some(2.01));
+    lh.quote(&QuoteParams { gas_on_arrival: Some(GasOnArrivalRequest::Usd(5.5)), ..params() }).await.unwrap();
+    let plain = lh.quote(&params()).await.unwrap();
+    assert!(plain.best.gas_on_arrival.is_none());
+}
+
+#[test]
+fn order_limit_order_id_parses() {
+    let o: Order = serde_json::from_value(json!({ "quoteId": "lof_1", "limitOrderId": "lo_1" })).unwrap();
+    assert_eq!(o.limit_order_id.as_deref(), Some("lo_1"));
+    let o: Order = serde_json::from_value(json!({ "quoteId": "q_1" })).unwrap();
+    assert_eq!(o.limit_order_id, None);
 }
 
 #[tokio::test]

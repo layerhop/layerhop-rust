@@ -275,6 +275,7 @@ async fn test_mode_fields() {
             sender: "a".into(),
             recipient: "b".into(),
             slippage_bps: None,
+            gas_on_arrival: None,
         })
         .await
         .unwrap();
