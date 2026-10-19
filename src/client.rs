@@ -221,6 +221,11 @@ impl LayerHop {
         if let Some(bps) = self.integrator_fee_bps {
             q.push(("integratorFeeBps", bps.to_string()));
         }
+        match p.gas_on_arrival {
+            Some(GasOnArrivalRequest::Usd(usd)) => q.push(("gasOnArrivalUsd", usd.to_string())),
+            Some(GasOnArrivalRequest::Default) => q.push(("gasOnArrival", "true".to_string())),
+            None => {}
+        }
         self.call(Method::GET, "/quote", &q, None).await
     }
 
@@ -311,6 +316,21 @@ impl LayerHop {
     /// disabled by the operator (`FORBIDDEN`); test keys always work and can `simulate` a deposit.
     pub fn deposit_addresses(&self) -> DepositAddresses<'_> {
         DepositAddresses { client: self }
+    }
+
+    /// Subscriptions: recurring billing as one invoice per period, emailed to the customer and paid
+    /// with any token. Unpaid past the due date → `past_due` with reminders, canceled after 7 days.
+    /// Everything needs an API key.
+    pub fn subscriptions(&self) -> Subscriptions<'_> {
+        Subscriptions { client: self }
+    }
+
+    /// Solana limit orders (beta, Jupiter Trigger). `create` returns an unsigned tx: have the wallet
+    /// sign it (sign only), then `submit` it; `cancel` works the same way. An API key is optional
+    /// (list by wallet without one). Live mode may be disabled by the operator (`FORBIDDEN`); test
+    /// keys always work and can `simulate` fills.
+    pub fn limit_orders(&self) -> LimitOrders<'_> {
+        LimitOrders { client: self }
     }
 
     /// `GET /v1/status` — public service status (status.layerhop.com): overall state, per-component
@@ -603,6 +623,152 @@ impl DepositAddresses<'_> {
     pub async fn simulate(&self, id: &str, amount: &str) -> Result<SimulateDepositResponse> {
         let path = format!("/deposit-addresses/{}/simulate", urlencoding::encode(id));
         self.client.call(Method::POST, &path, &[], Some(json!({ "amount": amount }))).await
+    }
+}
+
+/// Subscription endpoints, from [`LayerHop::subscriptions`]. All need an API key.
+#[derive(Debug, Clone, Copy)]
+pub struct Subscriptions<'a> {
+    client: &'a LayerHop,
+}
+
+impl Subscriptions<'_> {
+    /// `POST /v1/subscriptions` — start billing a customer every period (`subscription.created`).
+    pub async fn create(&self, p: &CreateSubscriptionParams) -> Result<Subscription> {
+        self.client.call(Method::POST, "/subscriptions", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `GET /v1/subscriptions/{id}` — one of your subscriptions.
+    pub async fn get(&self, id: &str) -> Result<Subscription> {
+        let path = format!("/subscriptions/{}", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+
+    /// `GET /v1/subscriptions` — your subscriptions of the key's mode (live or test), newest first.
+    pub async fn list(&self, p: &ListSubscriptionsParams) -> Result<ListSubscriptionsResponse> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = &p.status {
+            q.push(("status", v.clone()));
+        }
+        if let Some(v) = &p.customer_email {
+            q.push(("customerEmail", v.clone()));
+        }
+        if let Some(v) = &p.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        self.client.call(Method::GET, "/subscriptions", &q, None).await
+    }
+
+    /// `PATCH /v1/subscriptions/{id}` — change only the fields that are `Some`; applies from the
+    /// next invoice. `CONFLICT` when canceled.
+    pub async fn update(&self, id: &str, p: &UpdateSubscriptionParams) -> Result<Subscription> {
+        let path = format!("/subscriptions/{}", urlencoding::encode(id));
+        self.client.call(Method::PATCH, &path, &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `POST /v1/subscriptions/{id}/cancel` — cancel now (`at_period_end: false`: no more invoices,
+    /// `subscription.canceled`) or at the end of the current period (`true`).
+    pub async fn cancel(&self, id: &str, at_period_end: bool) -> Result<Subscription> {
+        let path = format!("/subscriptions/{}/cancel", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({ "atPeriodEnd": at_period_end }))).await
+    }
+
+    /// `POST /v1/subscriptions/{id}/pause` — active only: no invoices or reminders until resumed.
+    pub async fn pause(&self, id: &str) -> Result<Subscription> {
+        let path = format!("/subscriptions/{}/pause", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `POST /v1/subscriptions/{id}/resume` — paused only: continues the paid period's schedule, or
+    /// starts a new period now.
+    pub async fn resume(&self, id: &str) -> Result<Subscription> {
+        let path = format!("/subscriptions/{}/resume", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `GET /v1/subscriptions/{id}/invoices` — the invoices issued for it (up to 100), newest first.
+    pub async fn invoices(&self, id: &str) -> Result<Vec<Invoice>> {
+        let path = format!("/subscriptions/{}/invoices", urlencoding::encode(id));
+        let r: SubscriptionInvoicesResponse = self.client.call(Method::GET, &path, &[], None).await?;
+        Ok(r.invoices)
+    }
+}
+
+/// Limit order endpoints, from [`LayerHop::limit_orders`].
+#[derive(Debug, Clone, Copy)]
+pub struct LimitOrders<'a> {
+    client: &'a LayerHop,
+}
+
+impl LimitOrders<'_> {
+    /// `POST /v1/limit-orders` — build an order; the response carries the unsigned `tx` for the
+    /// wallet to sign, then [`LimitOrders::submit`]. `channel`, `integrator` and
+    /// `integrator_fee_bps` default to the client's. Live mode may be disabled by the operator: a
+    /// live request then gets a `FORBIDDEN` [`Error::Api`].
+    pub async fn create(&self, p: &CreateLimitOrderParams) -> Result<LimitOrder> {
+        let mut p = p.clone();
+        if p.channel.is_none() {
+            p.channel = Some(self.client.channel.clone());
+        }
+        if p.integrator.is_none() {
+            p.integrator = self.client.integrator.clone();
+        }
+        if p.integrator_fee_bps.is_none() {
+            p.integrator_fee_bps = self.client.integrator_fee_bps;
+        }
+        self.client.call(Method::POST, "/limit-orders", &[], Some(serde_json::to_value(&p)?)).await
+    }
+
+    /// `POST /v1/limit-orders/{id}/submit` — send the wallet-signed create or cancel tx (base64).
+    /// Returns the order and the transaction signature. `CONFLICT` when there is nothing to submit.
+    pub async fn submit(&self, id: &str, signed_transaction: &str) -> Result<SubmitLimitOrderResponse> {
+        let path = format!("/limit-orders/{}/submit", urlencoding::encode(id));
+        self.client
+            .call(Method::POST, &path, &[], Some(json!({ "signedTransaction": signed_transaction })))
+            .await
+    }
+
+    /// `GET /v1/limit-orders/{id}` — the order with its `fills` (orders), newest first.
+    pub async fn get(&self, id: &str) -> Result<LimitOrder> {
+        let path = format!("/limit-orders/{}", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+
+    /// `GET /v1/limit-orders` — orders of `wallet`, or without it your API key's account, newest
+    /// first.
+    pub async fn list(&self, p: &ListLimitOrdersParams) -> Result<ListLimitOrdersResponse> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = &p.wallet {
+            q.push(("wallet", v.clone()));
+        }
+        if let Some(v) = &p.status {
+            q.push(("status", v.clone()));
+        }
+        if let Some(v) = &p.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        self.client.call(Method::GET, "/limit-orders", &q, None).await
+    }
+
+    /// `POST /v1/limit-orders/{id}/cancel` — an open order: the cancel tx to sign and
+    /// [`LimitOrders::submit`]. A never-submitted (`built`) order is cancelled at once (`tx: None`).
+    pub async fn cancel(&self, id: &str) -> Result<CancelLimitOrderResponse> {
+        let path = format!("/limit-orders/{}/cancel", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `POST /v1/limit-orders/{id}/simulate` — test keys only (`FORBIDDEN` otherwise): `outcome` is
+    /// `fill` (the rest), `partial_fill` (half the rest) or `expire`, applied by the worker within
+    /// seconds with the usual `limit_order.*` webhooks.
+    pub async fn simulate(&self, id: &str, outcome: &str) -> Result<LimitOrder> {
+        let path = format!("/limit-orders/{}/simulate", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({ "outcome": outcome }))).await
     }
 }
 

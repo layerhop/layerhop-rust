@@ -67,6 +67,35 @@ pub struct QuoteParams {
     pub recipient: String,
     /// Defaults to 50.
     pub slippage_bps: Option<u32>,
+    /// Also deliver native gas to the recipient on the destination chain. Ignored for same-chain
+    /// swaps, non-EVM destinations and native outputs; providers that can't do it ignore it
+    /// (check [`Quote::gas_on_arrival`]).
+    pub gas_on_arrival: Option<GasOnArrivalRequest>,
+}
+
+/// How much native gas [`QuoteParams::gas_on_arrival`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GasOnArrivalRequest {
+    /// The default, $2 (sent as `gasOnArrival=true`).
+    Default,
+    /// A USD amount, 0.5–20 (sent as `gasOnArrivalUsd`).
+    Usd(f64),
+}
+
+/// Native gas a route delivers to the recipient on top of `dst_amount` (its cost is already taken
+/// out of `dst_amount`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GasOnArrival {
+    /// Base units of the destination chain's native token.
+    pub amount: String,
+    /// Native token address on the destination chain (`0x000…000`).
+    pub token: String,
+    pub symbol: String,
+    pub decimals: u32,
+    /// USD value at quote time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -96,6 +125,9 @@ pub struct Quote {
     pub fees: FeeBreakdown,
     /// Unix seconds. Build the order before this time.
     pub expires_at: u64,
+    /// Native gas delivered to the recipient on top of `dst_amount` (when requested and included).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_on_arrival: Option<GasOnArrival>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -291,6 +323,8 @@ pub struct Order {
     pub checkout_session_id: Option<String>,
     /// The deposit address this order came from, if any.
     pub deposit_address_id: Option<String>,
+    /// The limit order this order is a fill of, if any (`quote_id` then starts with `lof_`).
+    pub limit_order_id: Option<String>,
     /// The checkout refund this order executes, if any.
     pub refund_id: Option<String>,
     pub created_at: Option<String>,
@@ -633,7 +667,10 @@ pub struct WebhookEvent {
     /// `order.submitted` · `order.filled` · `order.refunded` · `order.failed` ·
     /// `checkout.session.processing` · `checkout.session.completed` ·
     /// `checkout.session.payment_failed` · `checkout.session.expired` ·
-    /// `checkout.session.refunded` · `invoice.sent` · `invoice.paid` (or `webhook.test`).
+    /// `checkout.session.refunded` · `invoice.sent` · `invoice.paid` · `subscription.created` ·
+    /// `subscription.renewed` · `subscription.past_due` · `subscription.canceled` ·
+    /// `limit_order.opened` · `limit_order.filled` · `limit_order.cancelled` ·
+    /// `limit_order.expired` · `limit_order.failed` (or `webhook.test`).
     #[serde(rename = "type")]
     pub event_type: String,
     pub livemode: bool,
@@ -647,7 +684,10 @@ pub struct WebhookEvent {
 
 /// The objects a [`WebhookEvent`] is about: `order` for `order.*` events, `session` for
 /// `checkout.session.*` events (plus `refund` for `checkout.session.refunded`), `invoice` for
-/// `invoice.*` events (plus the paying `session` for `invoice.paid`).
+/// `invoice.*` events (plus the paying `session` for `invoice.paid`), `subscription` for
+/// `subscription.*` events (plus `invoice` for `subscription.renewed` / `subscription.past_due`),
+/// `limit_order` for `limit_order.*` events (plus `fill`, the fill's order, for every
+/// `limit_order.filled`, partial fills included).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WebhookEventData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -658,6 +698,12 @@ pub struct WebhookEventData {
     pub refund: Option<Refund>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoice: Option<Invoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<Subscription>,
+    #[serde(default, rename = "limitOrder", skip_serializing_if = "Option::is_none")]
+    pub limit_order: Option<LimitOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Order>,
 }
 
 /// Response of [`crate::Webhooks::trigger`] (`POST /v1/webhooks/trigger`).
@@ -782,6 +828,9 @@ pub struct Invoice {
     /// Owner only: the checkout session that pays (or last tried to pay) the invoice.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Owner only: the subscription this invoice bills a period of, if any.
+    #[serde(default)]
+    pub subscription_id: Option<String>,
     #[serde(default)]
     pub sent_at: Option<String>,
     #[serde(default)]
@@ -958,6 +1007,325 @@ pub struct ListDepositAddressesResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulateDepositResponse {
     pub order: Order,
+}
+
+/// Parameters for [`crate::Subscriptions::create`] (`POST /v1/subscriptions`). Bill either a
+/// product (`product_id`) or your own price (`amount`, `settle_chain`, `settle_token`, `recipient`
+/// and `description`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSubscriptionParams {
+    /// Where each period's invoice and the reminders are emailed.
+    pub customer_email: String,
+    /// `day` · `week` · `month` · `year`.
+    pub interval: String,
+    /// Bill every `interval_count` intervals (1–365, API default 1; 3 + `month` = quarterly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_count: Option<u32>,
+    /// Bill this product's price, settlement token and payout address (instead of the four fields
+    /// below).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Price per period, base units of the settlement token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    /// Settlement chain id or slug: ethereum, arbitrum, base, optimism, bsc, polygon or solana.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_chain: Option<String>,
+    /// `"USDC"` or `"USDT"` (or its address) on that chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_token: Option<String>,
+    /// Your payout address on the settlement chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    /// The invoice line item, e.g. `"Pro plan"` (required without `product_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merchant_name: Option<String>,
+    /// A note on every invoice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    /// Days after an invoice is issued that it is due (0–60, API default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days_until_due: Option<u32>,
+    /// ISO date-time of the first period and invoice (default now, at most 366 days ahead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_at: Option<String>,
+    /// Up to 20 string values, returned in the API and webhooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BTreeMap<String, String>>,
+}
+
+/// Parameters for [`crate::Subscriptions::update`] (`PATCH /v1/subscriptions/{id}`). Changes apply
+/// from the next invoice. Only `Some` fields are sent; `Some(None)` on a nullable field sends
+/// `null` to clear it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSubscriptionParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_name: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merchant_name: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub days_until_due: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Option<BTreeMap<String, String>>>,
+    /// `Some(true)` schedules a cancel at the end of the current period; `Some(false)` undoes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_at_period_end: Option<bool>,
+}
+
+/// A subscription (`object: "subscription"`): recurring billing as one invoice per period. Crypto
+/// can't be pulled from a wallet, so LayerHop issues and emails an [`Invoice`] every period and the
+/// customer pays it with any token. Unpaid past the due date → `past_due` with reminders, canceled
+/// after 7 days.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Subscription {
+    pub id: String,
+    pub object: String,
+    pub livemode: bool,
+    /// `active` · `past_due` · `paused` · `canceled`.
+    pub status: String,
+    pub customer_email: String,
+    #[serde(default)]
+    pub customer_name: Option<String>,
+    #[serde(default)]
+    pub merchant_name: Option<String>,
+    pub description: String,
+    #[serde(default)]
+    pub memo: Option<String>,
+    #[serde(default)]
+    pub product_id: Option<String>,
+    /// Price per period, base units of the settlement token.
+    pub amount: String,
+    pub settlement: CheckoutSettlement,
+    /// Your payout address.
+    pub recipient: String,
+    /// `day` · `week` · `month` · `year`.
+    pub interval: String,
+    pub interval_count: u32,
+    pub days_until_due: u32,
+    /// Start of the period last invoiced (`None` before the first invoice).
+    #[serde(default)]
+    pub current_period_start: Option<String>,
+    #[serde(default)]
+    pub current_period_end: Option<String>,
+    /// When the next invoice is issued (`None` when paused or canceled).
+    #[serde(default)]
+    pub next_invoice_at: Option<String>,
+    /// Scheduled cancel (the end of the current period).
+    #[serde(default)]
+    pub cancel_at: Option<String>,
+    #[serde(default)]
+    pub cancel_at_period_end: bool,
+    #[serde(default)]
+    pub canceled_at: Option<String>,
+    /// `requested` (you canceled) or `unpaid` (7 days past due).
+    #[serde(default)]
+    pub cancellation_reason: Option<String>,
+    #[serde(default)]
+    pub paused_at: Option<String>,
+    /// The invoice of the current period.
+    #[serde(default)]
+    pub latest_invoice_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<BTreeMap<String, String>>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Subscription {
+    /// `active`: an invoice is issued every period.
+    pub fn is_active(&self) -> bool {
+        self.status == "active"
+    }
+}
+
+/// Parameters for [`crate::Subscriptions::list`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListSubscriptionsParams {
+    /// `active` · `past_due` · `paused` · `canceled`.
+    pub status: Option<String>,
+    pub customer_email: Option<String>,
+    pub cursor: Option<String>,
+    /// 1–100.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSubscriptionsResponse {
+    #[serde(default)]
+    pub subscriptions: Vec<Subscription>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SubscriptionInvoicesResponse {
+    #[serde(default)]
+    pub invoices: Vec<Invoice>,
+}
+
+/// Parameters for [`crate::LimitOrders::create`] (`POST /v1/limit-orders`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLimitOrderParams {
+    /// The maker wallet (base58): signs the order and receives the output.
+    pub wallet: String,
+    /// Token to sell: mint, curated symbol (`"USDC"`) or `"SOL"`.
+    pub src_token: String,
+    /// Token to buy. LayerHop's fee applies when it is SOL, USDC or USDT.
+    pub dst_token: String,
+    /// Base units of `src_token` to sell (worth at least $5).
+    pub amount: String,
+    /// Minimum base units of `dst_token` for the whole `amount`: the limit price is
+    /// `dst_amount / amount`.
+    pub dst_amount: String,
+    /// Unix seconds, at least 60 s ahead. `None` for good-till-cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    /// Only `"solana"` (or `"7565164"`) for now, the API default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    /// Defaults to the client's [`crate::LayerHopBuilder::channel`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Up to 20 string values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BTreeMap<String, String>>,
+    /// Defaults to the client's [`crate::LayerHopBuilder::integrator`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrator: Option<String>,
+    /// Defaults to the client's [`crate::LayerHopBuilder::integrator_fee_bps`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrator_fee_bps: Option<u32>,
+}
+
+/// The fee written into an on-chain [`LimitOrder`] (0 when `dst_token` carries no fee).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitOrderFees {
+    pub our_fee_bps: u32,
+    pub integrator_fee_bps: u32,
+    /// The partner id, if a partner fee applies.
+    #[serde(default)]
+    pub integrator: Option<String>,
+}
+
+/// A Solana limit order (`object: "limit_order"`, Jupiter Trigger). The order lives on chain and
+/// the wallet signs every transaction; each fill becomes an [`Order`] with `limit_order_id` set
+/// (its `quote_id` starts with `lof_`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitOrder {
+    pub id: String,
+    pub object: String,
+    pub livemode: bool,
+    /// `built` · `open` · `filled` · `cancelled` · `expired` · `failed`.
+    pub status: String,
+    #[serde(default)]
+    pub status_detail: Option<String>,
+    /// `jupiter` (live) or `sandbox` (test mode).
+    pub provider: ProviderId,
+    /// Always `7565164` (Solana) for now.
+    pub chain_id: u64,
+    pub wallet: String,
+    /// Mint sold.
+    pub src_token: String,
+    /// Mint bought.
+    pub dst_token: String,
+    /// Input, base units.
+    pub amount: String,
+    /// Minimum output for the whole order, base units.
+    pub dst_amount: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    pub fees: LimitOrderFees,
+    /// The provider's order id (Jupiter: the order account).
+    pub provider_order_id: String,
+    pub filled_amount: String,
+    pub filled_dst_amount: String,
+    #[serde(default)]
+    pub fill_count: u64,
+    /// The transaction that opened the order.
+    #[serde(default)]
+    pub open_tx_hash: Option<String>,
+    /// Set once a cancel tx was submitted; the status turns `cancelled` when the provider confirms.
+    #[serde(default)]
+    pub cancel_tx_hash: Option<String>,
+    pub channel: String,
+    #[serde(default)]
+    pub metadata: Option<BTreeMap<String, String>>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// The unsigned tx for `wallet` to sign, then [`crate::LimitOrders::submit`]
+    /// ([`crate::LimitOrders::create`] only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx: Option<SvmTx>,
+    /// The fills, newest first ([`crate::LimitOrders::get`] only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fills: Option<Vec<Order>>,
+}
+
+impl LimitOrder {
+    /// `filled`, `cancelled`, `expired` or `failed`: the order will not change again.
+    pub fn is_final(&self) -> bool {
+        matches!(self.status.as_str(), "filled" | "cancelled" | "expired" | "failed")
+    }
+}
+
+/// Parameters for [`crate::LimitOrders::list`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListLimitOrdersParams {
+    /// Orders of this wallet; `None` lists your API key's account (a key is then required).
+    pub wallet: Option<String>,
+    /// `built` · `open` · `filled` · `cancelled` · `expired` · `failed`.
+    pub status: Option<String>,
+    pub cursor: Option<String>,
+    /// 1–100.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListLimitOrdersResponse {
+    #[serde(default)]
+    pub limit_orders: Vec<LimitOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Response of [`crate::LimitOrders::submit`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitLimitOrderResponse {
+    pub limit_order: LimitOrder,
+    /// The landed transaction's signature.
+    pub tx_hash: String,
+}
+
+/// Response of [`crate::LimitOrders::cancel`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelLimitOrderResponse {
+    pub limit_order: LimitOrder,
+    /// The unsigned cancel tx to sign and [`crate::LimitOrders::submit`]; `None` when a `built`
+    /// (never submitted) order was cancelled directly.
+    #[serde(default)]
+    pub tx: Option<SvmTx>,
 }
 
 /// Parameters for [`crate::CheckoutRefunds::create`]. All optional.

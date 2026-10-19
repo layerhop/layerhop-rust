@@ -45,6 +45,7 @@ async fn main() -> layerhop::Result<()> {
             sender: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".into(),
             recipient: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".into(),
             slippage_bps: Some(50),
+            gas_on_arrival: None,
         })
         .await?;
     let best = &quotes.best;
@@ -125,6 +126,20 @@ async fn main() -> layerhop::Result<()> {
 | `deposit_addresses().refresh(id)` | `POST /v1/deposit-addresses/{id}/refresh` |
 | `deposit_addresses().disable(id)` | `POST /v1/deposit-addresses/{id}/disable` |
 | `deposit_addresses().simulate(id, amount)` | `POST /v1/deposit-addresses/{id}/simulate` (test keys only) |
+| `subscriptions().create(&CreateSubscriptionParams)` | `POST /v1/subscriptions` |
+| `subscriptions().list(&ListSubscriptionsParams)` | `GET /v1/subscriptions?status=&customerEmail=&cursor=&limit=` |
+| `subscriptions().get(id)` | `GET /v1/subscriptions/{id}` |
+| `subscriptions().update(id, &UpdateSubscriptionParams)` | `PATCH /v1/subscriptions/{id}` (only `Some` fields) |
+| `subscriptions().cancel(id, at_period_end)` | `POST /v1/subscriptions/{id}/cancel` |
+| `subscriptions().pause(id)` | `POST /v1/subscriptions/{id}/pause` |
+| `subscriptions().resume(id)` | `POST /v1/subscriptions/{id}/resume` |
+| `subscriptions().invoices(id)` | `GET /v1/subscriptions/{id}/invoices` |
+| `limit_orders().create(&CreateLimitOrderParams)` | `POST /v1/limit-orders` |
+| `limit_orders().submit(id, signed_base64)` | `POST /v1/limit-orders/{id}/submit` |
+| `limit_orders().list(&ListLimitOrdersParams)` | `GET /v1/limit-orders?wallet=&status=&cursor=&limit=` |
+| `limit_orders().get(id)` | `GET /v1/limit-orders/{id}` (with its `fills`) |
+| `limit_orders().cancel(id)` | `POST /v1/limit-orders/{id}/cancel` |
+| `limit_orders().simulate(id, outcome)` | `POST /v1/limit-orders/{id}/simulate` (test keys only) |
 | `service_status()` | `GET /v1/status` (public) |
 | `webhooks().stream()` | `GET /v1/webhooks/stream` (SSE, API key) |
 | `webhooks().trigger(event_type)` | `POST /v1/webhooks/trigger` (test keys only) |
@@ -245,6 +260,26 @@ println!("{} {:?}", session.url, session.product_id);
 
 See the [payment buttons guide](https://docs.layerhop.com/guides/payment-buttons).
 
+## Gas on arrival
+
+Set `gas_on_arrival` on a quote to also deliver native gas on the destination chain, so the
+recipient can transact right away: `GasOnArrivalRequest::Default` ($2) or
+`GasOnArrivalRequest::Usd(5.0)` (0.5–20). Its cost comes out of `dst_amount`. It is ignored for
+same-chain swaps, non-EVM destinations and native outputs, and providers that can't do it ignore it
+(quotes that include it rank first), so check `quote.gas_on_arrival`. See the
+[gas on arrival guide](https://docs.layerhop.com/guides/gas-on-arrival).
+
+```rust
+use layerhop::{GasOnArrivalRequest, QuoteParams};
+
+let q = lh
+    .quote(&QuoteParams { gas_on_arrival: Some(GasOnArrivalRequest::Default), ..params })
+    .await?;
+if let Some(g) = &q.best.gas_on_arrival {
+    println!("plus {} {} (${:?})", g.amount, g.symbol, g.usd); // base units of the native token
+}
+```
+
 ## Invoices
 
 Bill a customer by email: line items, a due date and a memo, paid through checkout with any
@@ -326,6 +361,88 @@ lh.deposit_addresses().disable(&da.id).await?;
 Live mode may be disabled by the operator: a live key then gets an `Error::Api` with code
 `FORBIDDEN`. Test keys always work, and `lh.deposit_addresses().simulate(&da.id, "25000000")`
 records a test deposit that settles like any test order. Deposits under $1 may not be processed.
+
+## Subscriptions
+
+Recurring billing in crypto. A wallet can't be charged automatically, so LayerHop issues an
+invoice every period and emails it to the customer, who pays it with any token (each invoice has
+`subscription_id` set). Unpaid past the due date, the subscription turns `past_due` and reminders
+go out (day 1 and 3); after 7 days it is canceled. Webhooks: `subscription.created`,
+`subscription.renewed`, `subscription.past_due`, `subscription.canceled`. Everything needs an API
+key.
+
+```rust
+use layerhop::{CreateSubscriptionParams, ListSubscriptionsParams, UpdateSubscriptionParams};
+
+let sub = lh
+    .subscriptions()
+    .create(&CreateSubscriptionParams {
+        customer_email: "ada@example.com".into(),
+        interval: "month".into(), // day · week · month · year (interval_count: Some(3) = quarterly)
+        amount: Some("49000000".into()), // 49 USDC per period
+        settle_chain: Some("base".into()),
+        settle_token: Some("USDC".into()),
+        recipient: Some("0xYourPayoutAddress".into()),
+        description: Some("Pro plan".into()),
+        // or product_id: Some("prod_...".into()) instead of the five fields above
+        ..Default::default()
+    })
+    .await?;
+println!("{} {} {:?}", sub.id, sub.status, sub.next_invoice_at);
+
+lh.subscriptions()
+    .update(&sub.id, &UpdateSubscriptionParams { amount: Some("59000000".into()), ..Default::default() })
+    .await?; // applies from the next invoice
+lh.subscriptions().pause(&sub.id).await?;
+lh.subscriptions().resume(&sub.id).await?;
+let invoices = lh.subscriptions().invoices(&sub.id).await?; // newest first
+lh.subscriptions().cancel(&sub.id, true).await?; // at period end; false = now
+lh.subscriptions()
+    .list(&ListSubscriptionsParams { status: Some("past_due".into()), ..Default::default() })
+    .await?;
+```
+
+Statuses: `active`, `past_due`, `paused`, `canceled`. See the
+[subscriptions guide](https://docs.layerhop.com/guides/subscriptions).
+
+## Limit orders
+
+Solana limit orders (beta, Jupiter Trigger): sell `amount` of `src_token` for at least
+`dst_amount` of `dst_token`, filled on chain when the price is reached. The wallet signs every
+transaction; LayerHop never holds funds. Each fill becomes an order with `limit_order_id` set.
+Webhooks: `limit_order.opened`, `limit_order.filled` (every fill, with `data.fill`),
+`limit_order.cancelled`, `limit_order.expired`, `limit_order.failed`. An API key is optional
+(list by `wallet` without one).
+
+```rust
+use layerhop::{CreateLimitOrderParams, ListLimitOrdersParams};
+
+let order = lh
+    .limit_orders()
+    .create(&CreateLimitOrderParams {
+        wallet: "9WzD...".into(),
+        src_token: "USDC".into(),
+        dst_token: "SOL".into(),
+        amount: "100000000".into(),     // sell 100 USDC (at least $5)
+        dst_amount: "500000000".into(), // for at least 0.5 SOL
+        expires_at: None,               // good till cancelled
+        ..Default::default()
+    })
+    .await?;
+// order.tx: sign only (submit_via_api), then submit the signed base64 tx.
+let r = lh.limit_orders().submit(&order.id, &signed_base64).await?; // r.limit_order.status == "open"
+
+let o = lh.limit_orders().get(&order.id).await?; // o.filled_amount, o.fills
+let c = lh.limit_orders().cancel(&order.id).await?; // c.tx: sign it and submit it the same way
+lh.limit_orders()
+    .list(&ListLimitOrdersParams { wallet: Some("9WzD...".into()), ..Default::default() })
+    .await?;
+```
+
+Live mode may be disabled by the operator: a live request then gets an `Error::Api` with code
+`FORBIDDEN`. Test keys always work, and `lh.limit_orders().simulate(&id, "fill")` (or
+`"partial_fill"`, `"expire"`) moves a test order along. See the
+[limit orders guide](https://docs.layerhop.com/guides/limit-and-recurring-orders).
 
 ## Refunds
 
@@ -411,6 +528,10 @@ webhook::verify(&secret, &raw_body, signature_header)?; // default 300 s toleran
 With an API key, `webhooks().stream()` yields your account's webhook events (in the key's live or
 test mode) as `WebhookEvent`s as they are created. `webhooks().trigger(event_type)` creates a
 sample event in test mode (test keys only; a live key returns `Error::Api` with `FORBIDDEN`).
+Event types: `order.*` (`submitted`, `filled`, `refunded`, `failed`), `checkout.session.*`
+(`processing`, `completed`, `payment_failed`, `expired`, `refunded`), `invoice.sent`,
+`invoice.paid`, `subscription.*` (`created`, `renewed`, `past_due`, `canceled`) and
+`limit_order.*` (`opened`, `filled`, `cancelled`, `expired`, `failed`).
 
 ```rust
 let lh = LayerHop::builder().api_key("lh_test_...").build();
