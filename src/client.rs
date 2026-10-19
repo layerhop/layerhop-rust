@@ -306,6 +306,13 @@ impl LayerHop {
         Invoices { client: self }
     }
 
+    /// Deposit addresses: your user sends tokens to an address (no wallet connection) and the
+    /// provider delivers the destination token. Everything needs an API key. Live mode may be
+    /// disabled by the operator (`FORBIDDEN`); test keys always work and can `simulate` a deposit.
+    pub fn deposit_addresses(&self) -> DepositAddresses<'_> {
+        DepositAddresses { client: self }
+    }
+
     /// `GET /v1/status` — public service status (status.layerhop.com): overall state, per-component
     /// status and 90-day uptime, recent incidents. ([`LayerHop::status`] tracks one order.)
     pub async fn service_status(&self) -> Result<StatusResponse> {
@@ -528,6 +535,74 @@ impl Invoices<'_> {
     pub async fn pay(&self, id: &str) -> Result<PayInvoiceResponse> {
         let path = format!("/invoices/{}/pay", urlencoding::encode(id));
         self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+}
+
+/// Deposit address endpoints, from [`LayerHop::deposit_addresses`]. All need an API key.
+#[derive(Debug, Clone, Copy)]
+pub struct DepositAddresses<'a> {
+    client: &'a LayerHop,
+}
+
+impl DepositAddresses<'_> {
+    /// `POST /v1/deposit-addresses` — create an address; show `address` to your user. The response
+    /// carries an `estimate`. `integrator` / `integrator_fee_bps` default to the client's. Live mode
+    /// may be disabled by the operator: a live key then gets a `FORBIDDEN` [`Error::Api`].
+    pub async fn create(&self, p: &CreateDepositAddressParams) -> Result<DepositAddress> {
+        let mut p = p.clone();
+        if p.integrator.is_none() {
+            p.integrator = self.client.integrator.clone();
+        }
+        if p.integrator_fee_bps.is_none() {
+            p.integrator_fee_bps = self.client.integrator_fee_bps;
+        }
+        self.client.call(Method::POST, "/deposit-addresses", &[], Some(serde_json::to_value(&p)?)).await
+    }
+
+    /// `GET /v1/deposit-addresses/{id}` — the address with its 20 most recent `deposits` (orders).
+    pub async fn get(&self, id: &str) -> Result<DepositAddress> {
+        let path = format!("/deposit-addresses/{}", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+
+    /// `GET /v1/deposit-addresses` — your addresses of the key's mode (live or test), newest first.
+    pub async fn list(&self, p: &ListDepositAddressesParams) -> Result<ListDepositAddressesResponse> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = &p.status {
+            q.push(("status", v.clone()));
+        }
+        if let Some(v) = &p.label {
+            q.push(("label", v.clone()));
+        }
+        if let Some(v) = &p.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        self.client.call(Method::GET, "/deposit-addresses", &q, None).await
+    }
+
+    /// `POST /v1/deposit-addresses/{id}/refresh` — check for deposits now (call it when your user
+    /// says they sent). `CONFLICT` when disabled.
+    pub async fn refresh(&self, id: &str) -> Result<DepositAddress> {
+        let path = format!("/deposit-addresses/{}/refresh", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `POST /v1/deposit-addresses/{id}/disable` — stop tracking the address; tell your user not to
+    /// send to it again.
+    pub async fn disable(&self, id: &str) -> Result<DepositAddress> {
+        let path = format!("/deposit-addresses/{}/disable", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `POST /v1/deposit-addresses/{id}/simulate` — test keys only (`FORBIDDEN` otherwise): record a
+    /// deposit of `amount` (base units of the source token). It settles like any test order
+    /// (amounts ending in 4001 / 4002 end `refunded` / `failed`).
+    pub async fn simulate(&self, id: &str, amount: &str) -> Result<SimulateDepositResponse> {
+        let path = format!("/deposit-addresses/{}/simulate", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({ "amount": amount }))).await
     }
 }
 

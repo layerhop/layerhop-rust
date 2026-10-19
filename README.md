@@ -119,6 +119,12 @@ async fn main() -> layerhop::Result<()> {
 | `invoices().void(id)` | `POST /v1/invoices/{id}/void` |
 | `invoices().public_view(id)` | `GET /v1/invoices/{id}/public` (public) |
 | `invoices().pay(id)` | `POST /v1/invoices/{id}/pay` (public) |
+| `deposit_addresses().create(&CreateDepositAddressParams)` | `POST /v1/deposit-addresses` |
+| `deposit_addresses().list(&ListDepositAddressesParams)` | `GET /v1/deposit-addresses?status=&label=&cursor=&limit=` |
+| `deposit_addresses().get(id)` | `GET /v1/deposit-addresses/{id}` (with its recent `deposits`) |
+| `deposit_addresses().refresh(id)` | `POST /v1/deposit-addresses/{id}/refresh` |
+| `deposit_addresses().disable(id)` | `POST /v1/deposit-addresses/{id}/disable` |
+| `deposit_addresses().simulate(id, amount)` | `POST /v1/deposit-addresses/{id}/simulate` (test keys only) |
 | `service_status()` | `GET /v1/status` (public) |
 | `webhooks().stream()` | `GET /v1/webhooks/stream` (SSE, API key) |
 | `webhooks().trigger(event_type)` | `POST /v1/webhooks/trigger` (test keys only) |
@@ -282,6 +288,44 @@ let pay = LayerHop::new().invoices().pay(&inv.id).await?; // send the payer to p
 
 Statuses: `draft` → `open` → `paid`, or `void`. See the
 [invoices guide](https://docs.layerhop.com/guides/invoices).
+
+## Deposit addresses
+
+Let a user swap or bridge by just **sending** tokens to an address: no wallet connection, no
+signing in your app. The provider (Relay) owns the address and delivers `dst_token` to `recipient`;
+LayerHop never holds the funds. Each detected deposit becomes an order with `deposit_address_id`
+set and the usual `order.*` webhooks. Everything needs an API key.
+
+```rust
+use layerhop::{CreateDepositAddressParams, ListDepositAddressesParams};
+
+let da = lh
+    .deposit_addresses()
+    .create(&CreateDepositAddressParams {
+        src_chain: "base".into(),
+        src_token: "USDC".into(),
+        dst_chain: "arbitrum".into(),
+        dst_token: "USDC".into(),
+        recipient: "0xRecipientOnArbitrum".into(),
+        refund_to: "0xUserRefundAddressOnBase".into(), // never a CEX deposit address
+        label: Some("user_42".into()),
+        // reusable: None = reusable (any amount); Some(false) + amount = one-time address
+        ..Default::default()
+    })
+    .await?;
+println!("{} {:?}", da.address, da.estimate); // show the address to your user
+
+lh.deposit_addresses().refresh(&da.id).await?; // "I sent it": check for deposits now
+let got = lh.deposit_addresses().get(&da.id).await?; // got.deposits: its 20 most recent orders
+lh.deposit_addresses()
+    .list(&ListDepositAddressesParams { label: Some("user_42".into()), ..Default::default() })
+    .await?;
+lh.deposit_addresses().disable(&da.id).await?;
+```
+
+Live mode may be disabled by the operator: a live key then gets an `Error::Api` with code
+`FORBIDDEN`. Test keys always work, and `lh.deposit_addresses().simulate(&da.id, "25000000")`
+records a test deposit that settles like any test order. Deposits under $1 may not be processed.
 
 ## Refunds
 
