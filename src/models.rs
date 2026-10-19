@@ -277,6 +277,8 @@ pub struct Order {
     pub livemode: Option<bool>,
     /// The checkout session this order pays, if any.
     pub checkout_session_id: Option<String>,
+    /// The deposit address this order came from, if any.
+    pub deposit_address_id: Option<String>,
     /// The checkout refund this order executes, if any.
     pub refund_id: Option<String>,
     pub created_at: Option<String>,
@@ -811,6 +813,139 @@ pub struct PayInvoiceResponse {
     pub session_id: String,
     /// The hosted checkout page: send the payer here.
     pub url: String,
+}
+
+/// Parameters for [`crate::DepositAddresses::create`] (`POST /v1/deposit-addresses`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDepositAddressParams {
+    /// Chain id or slug the user sends on (`"base"`, `"8453"`).
+    pub src_chain: String,
+    /// Token the user sends (symbol or address on `src_chain`).
+    pub src_token: String,
+    pub dst_chain: String,
+    pub dst_token: String,
+    /// Receives `dst_token` on `dst_chain`.
+    pub recipient: String,
+    /// The user's address on `src_chain` for refunds. Never a CEX deposit address.
+    pub refund_to: String,
+    /// `None` / `Some(true)`: reusable (any amount, forever, for this route). `Some(false)`: a
+    /// one-time address for exactly `amount`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reusable: Option<bool>,
+    /// Base units of `src_token`: required for a one-time address; otherwise it sizes the estimate
+    /// (API default: about $100 of `src_token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    /// Your own tag (1–64 chars), filterable in [`crate::DepositAddresses::list`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Up to 20 string values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BTreeMap<String, String>>,
+    /// Defaults to the client's [`crate::LayerHopBuilder::integrator`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrator: Option<String>,
+    /// Defaults to the client's [`crate::LayerHopBuilder::integrator_fee_bps`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrator_fee_bps: Option<u32>,
+}
+
+/// Fees applied to every deposit of a [`DepositAddress`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositAddressFees {
+    pub our_fee_bps: u32,
+    pub integrator_fee_bps: u32,
+    /// The partner id, if a partner fee applies.
+    #[serde(default)]
+    pub integrator: Option<String>,
+}
+
+/// Price of one deposit of `amount`, returned by [`crate::DepositAddresses::create`] only.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositAddressEstimate {
+    pub amount: String,
+    pub dst_amount: String,
+    pub dst_amount_min: String,
+    pub estimated_seconds: u64,
+}
+
+/// A deposit address (`object: "deposit_address"`): the end user sends `token` to `address` on
+/// `chain_id`, and the provider delivers `dst_token` to `recipient` on `dst_chain_id`. LayerHop
+/// never holds the funds; each deposit becomes an [`Order`] with `deposit_address_id` set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositAddress {
+    pub id: String,
+    pub object: String,
+    pub livemode: bool,
+    /// `active` · `disabled`.
+    pub status: String,
+    /// `relay` (live) or `sandbox` (test mode).
+    pub provider: ProviderId,
+    /// Show this to your user: they send `token` here on `chain_id`.
+    pub address: String,
+    pub chain_id: u64,
+    pub token: String,
+    pub dst_chain_id: u64,
+    pub dst_token: String,
+    pub recipient: String,
+    pub refund_to: String,
+    pub reusable: bool,
+    /// One-time addresses only, base units of `token`.
+    #[serde(default)]
+    pub amount: Option<String>,
+    pub fees: DepositAddressFees,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub deposit_count: u64,
+    #[serde(default)]
+    pub last_deposit_at: Option<String>,
+    pub created_at: String,
+    /// Set by [`crate::DepositAddresses::create`] only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<DepositAddressEstimate>,
+    /// The 20 most recent deposits, newest first ([`crate::DepositAddresses::get`] only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposits: Option<Vec<Order>>,
+}
+
+impl DepositAddress {
+    /// `active`: deposits sent to it are tracked.
+    pub fn is_active(&self) -> bool {
+        self.status == "active"
+    }
+}
+
+/// Parameters for [`crate::DepositAddresses::list`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListDepositAddressesParams {
+    /// `active` · `disabled`.
+    pub status: Option<String>,
+    pub label: Option<String>,
+    pub cursor: Option<String>,
+    /// 1–100.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDepositAddressesResponse {
+    #[serde(default)]
+    pub deposit_addresses: Vec<DepositAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Response of [`crate::DepositAddresses::simulate`]: the test deposit order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulateDepositResponse {
+    pub order: Order,
 }
 
 /// Parameters for [`crate::CheckoutRefunds::create`]. All optional.

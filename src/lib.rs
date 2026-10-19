@@ -36,18 +36,20 @@ mod models;
 pub mod webhook;
 
 pub use client::{
-    Checkout, CheckoutProducts, CheckoutRefunds, Invoices, LayerHop, LayerHopBuilder, WatchOptions, Webhooks,
-    DEFAULT_BASE_URL,
+    Checkout, CheckoutProducts, CheckoutRefunds, DepositAddresses, Invoices, LayerHop, LayerHopBuilder, WatchOptions,
+    Webhooks, DEFAULT_BASE_URL,
 };
 pub use error::{Error, Result};
 pub use models::{
     Approval, BuiltTx, Chain, CheckoutPayment, CheckoutProduct, CheckoutQuote, CheckoutQuoteParams,
     CheckoutQuoteResponse, CheckoutSession, CheckoutSettlement, CreateCheckoutParams, CreateCheckoutProductParams,
-    CreateInvoiceParams, CreateRefundParams, CreateRefundResponse, EvmTx, FeeBreakdown, HealthResponse, Invoice,
-    InvoiceLineItem, ListCheckoutProductsParams, ListCheckoutProductsResponse, ListCheckoutSessionsParams,
-    ListCheckoutSessionsResponse, ListInvoicesParams, ListInvoicesResponse, ListOrdersParams, ListOrdersResponse,
-    ListRefundsResponse, Order, OrderStatus, PayInvoiceResponse, ProviderError, ProviderId, Quote, QuoteParams,
-    QuoteResponse, Refund, RefundDestination, RefundQuote, ReportSubmittedResponse, SimulateError, SimulateResponse,
+    CreateDepositAddressParams, CreateInvoiceParams, CreateRefundParams, CreateRefundResponse, DepositAddress,
+    DepositAddressEstimate, DepositAddressFees, EvmTx, FeeBreakdown, HealthResponse, Invoice, InvoiceLineItem,
+    ListCheckoutProductsParams, ListCheckoutProductsResponse, ListCheckoutSessionsParams,
+    ListCheckoutSessionsResponse, ListDepositAddressesParams, ListDepositAddressesResponse, ListInvoicesParams,
+    ListInvoicesResponse, ListOrdersParams, ListOrdersResponse, ListRefundsResponse, Order, OrderStatus,
+    PayInvoiceResponse, ProviderError, ProviderId, Quote, QuoteParams, QuoteResponse, Refund, RefundDestination,
+    RefundQuote, ReportSubmittedResponse, SimulateDepositResponse, SimulateError, SimulateResponse,
     StartProductCheckoutParams, StatusComponent, StatusDay, StatusIncident, StatusResponse, SvmTx, Token,
     TriggerWebhookResponse, UpdateCheckoutProductParams, UpdateInvoiceParams, WebhookEvent, WebhookEventData,
 };
