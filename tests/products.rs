@@ -40,7 +40,7 @@ fn session_json() -> serde_json::Value {
 
 #[test]
 fn version_is_0_5_0() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.0");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
 }
 
 #[tokio::test]
