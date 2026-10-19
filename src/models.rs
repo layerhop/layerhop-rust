@@ -127,6 +127,14 @@ pub struct Approval {
     pub amount: String,
 }
 
+/// A plain EVM call: target, hex calldata and native value in wei.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvmCall {
+    pub to: String,
+    pub data: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvmTx {
@@ -138,6 +146,10 @@ pub struct EvmTx {
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<Approval>,
+    /// Further calls to send after the main transaction, in order (e.g. LayerHop's fee transfer on a
+    /// same-token checkout payment). Report the main transaction's hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_txs: Option<Vec<EvmCall>>,
     /// Test mode only: a placeholder that moves no funds. Never broadcast it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<bool>,
