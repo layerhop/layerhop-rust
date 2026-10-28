@@ -150,8 +150,8 @@ Builder options: `base_url`, `api_key` (sent as `x-api-key`), `channel` (`api` b
 ## Live order status
 
 `stream_order` follows an order over Server-Sent Events instead of polling: a `Stream` that yields
-the order now and on every change, and ends once it is final (`filled`, `refunded`, `failed` or
-`expired`). `checkout().stream(id)` does the same for a checkout session (until `paid`, `expired`
+the order now and on every change, and ends once it is final (`filled`, `refunded`, `failed`,
+`expired` or `dropped`). `checkout().stream(id)` does the same for a checkout session (until `paid`, `expired`
 or `needs_review`).
 
 ```rust

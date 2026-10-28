@@ -276,14 +276,14 @@ pub struct OrderStatus {
 }
 
 impl OrderStatus {
-    /// `filled`, `refunded` or `failed`.
+    /// `filled`, `refunded`, `failed` or `dropped`.
     pub fn is_final(&self) -> bool {
         is_final_state(&self.state)
     }
 }
 
 pub(crate) fn is_final_state(state: &str) -> bool {
-    matches!(state, "filled" | "refunded" | "failed")
+    matches!(state, "filled" | "refunded" | "failed" | "dropped")
 }
 
 /// Parameters for [`crate::LayerHop::list_orders`].
@@ -664,7 +664,7 @@ pub struct CheckoutQuoteResponse {
 #[serde(rename_all = "camelCase")]
 pub struct WebhookEvent {
     pub id: String,
-    /// `order.submitted` · `order.filled` · `order.refunded` · `order.failed` ·
+    /// `order.submitted` · `order.filled` · `order.refunded` · `order.failed` · `order.dropped` ·
     /// `checkout.session.processing` · `checkout.session.completed` ·
     /// `checkout.session.payment_failed` · `checkout.session.expired` ·
     /// `checkout.session.refunded` · `invoice.sent` · `invoice.paid` · `subscription.created` ·

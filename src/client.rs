@@ -294,7 +294,7 @@ impl LayerHop {
     }
 
     /// `GET /v1/orders/{quoteId}/events` — live order status (Server-Sent Events). Yields the order
-    /// now and on every change, and ends when it is final (filled, refunded, failed or expired).
+    /// now and on every change, and ends when it is final (filled, refunded, failed, expired or dropped).
     /// Drop the stream to stop early. A missing order yields one `ORDER_NOT_FOUND` [`Error::Api`].
     pub fn stream_order(&self, quote_id: &str) -> impl Stream<Item = Result<Order>> + Send + 'static {
         self.sse(format!("/orders/{}/events", urlencoding::encode(quote_id)), "order")
@@ -339,7 +339,7 @@ impl LayerHop {
         self.call(Method::GET, "/status", &[], None).await
     }
 
-    /// Poll [`LayerHop::status`] until the order is final (`filled` / `refunded` / `failed`),
+    /// Poll [`LayerHop::status`] until the order is final (`filled` / `refunded` / `failed` / `dropped`),
     /// yielding each state change. Yields [`Error::Timeout`] (then ends) after `opts.timeout`,
     /// and ends after the first request error.
     pub fn watch(
