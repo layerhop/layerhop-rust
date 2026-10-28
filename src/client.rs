@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -109,6 +110,7 @@ struct ErrorBody {
     code: Option<String>,
     message: Option<String>,
     request_id: Option<String>,
+    details: Option<serde_json::Value>,
 }
 
 impl Default for LayerHop {
@@ -138,12 +140,26 @@ impl LayerHop {
         query: &[(&str, String)],
         body: Option<serde_json::Value>,
     ) -> Result<T> {
+        self.call_with_headers(method, path, query, body, &[]).await
+    }
+
+    async fn call_with_headers<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> Result<T> {
         let mut req = self.http.request(method, format!("{}/v1{}", self.base_url, path));
         if !query.is_empty() {
             req = req.query(query);
         }
         if let Some(key) = &self.api_key {
             req = req.header("x-api-key", key);
+        }
+        for (k, v) in headers {
+            req = req.header(*k, *v);
         }
         if let Some(b) = body {
             req = req.json(&b);
@@ -195,11 +211,73 @@ impl LayerHop {
         Ok(r.chains)
     }
 
-    /// `GET /v1/tokens?chain=` — the built-in token list for one chain (id or slug).
+    /// `GET /v1/tokens?chain=` — the first page of the token list for one chain (id or slug),
+    /// popular first. Use [`LayerHop::search_tokens`] to search or page.
     pub async fn tokens(&self, chain: &str) -> Result<Vec<Token>> {
-        let r: TokensResponse =
-            self.call(Method::GET, "/tokens", &[("chain", chain.to_string())], None).await?;
+        let r: TokensPage = self.call(Method::GET, "/tokens", &[("chain", chain.to_string())], None).await?;
         Ok(r.tokens)
+    }
+
+    /// `GET /v1/tokens` — search (`q`: symbol, name or address) and page a chain's tokens. An
+    /// unlisted address is read on-chain and comes back with `verified: false`.
+    pub async fn search_tokens(&self, p: &TokenSearchParams) -> Result<TokensPage> {
+        let mut q: Vec<(&str, String)> = vec![("chain", p.chain.clone())];
+        if let Some(v) = &p.q {
+            q.push(("q", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        if let Some(v) = &p.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        self.call(Method::GET, "/tokens", &q, None).await
+    }
+
+    /// `GET /v1/tokens/lookup` — one token by address / mint. Without `chain` the API finds the
+    /// chain from the address. Tokens read on-chain have `verified: false`.
+    pub async fn lookup_token(&self, address: &str, chain: Option<&str>) -> Result<Token> {
+        let mut q: Vec<(&str, String)> = vec![("address", address.to_string())];
+        if let Some(c) = chain {
+            q.push(("chain", c.to_string()));
+        }
+        let r: TokenLookupResponse = self.call(Method::GET, "/tokens/lookup", &q, None).await?;
+        Ok(r.token)
+    }
+
+    /// `GET /v1/tokens/{chain}/{address}/risk` — a short safety report (honeypots, taxes, owner
+    /// powers, fake majors). `level: "unknown"` means no source answered; never block a swap on it.
+    pub async fn get_token_risk(&self, chain: &str, address: &str) -> Result<TokenRisk> {
+        let path = format!("/tokens/{}/{}/risk", urlencoding::encode(chain), urlencoding::encode(address));
+        let r: TokenRiskResponse = self.call(Method::GET, &path, &[], None).await?;
+        Ok(r.risk)
+    }
+
+    /// `GET /v1/prices?ids=` — USD prices for up to 100 `chainId:address` ids, keyed by the ids as
+    /// given. Ids without a known price are left out. An empty `ids` returns an empty map without
+    /// a request.
+    pub async fn prices(&self, ids: &[&str]) -> Result<BTreeMap<String, f64>> {
+        if ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let r: PricesResponse = self.call(Method::GET, "/prices", &[("ids", ids.join(","))], None).await?;
+        Ok(r.prices)
+    }
+
+    /// `GET /v1/balances` — non-zero balances of a wallet (plus every requested token), highest USD
+    /// value first. Chains that fail are listed in `errors` and never fail the request.
+    pub async fn balances(&self, p: &BalancesParams) -> Result<BalancesResponse> {
+        let mut q: Vec<(&str, String)> = vec![("address", p.address.clone())];
+        if let Some(c) = p.chains.as_ref().filter(|c| !c.is_empty()) {
+            q.push(("chains", c.join(",")));
+        }
+        if let Some(t) = p.tokens.as_ref().filter(|t| !t.is_empty()) {
+            q.push(("tokens", t.join(",")));
+        }
+        if p.fresh {
+            q.push(("fresh", "1".to_string()));
+        }
+        self.call(Method::GET, "/balances", &q, None).await
     }
 
     /// `GET /v1/quote` — asks every provider; `best` is the highest output for the user.
@@ -226,14 +304,112 @@ impl LayerHop {
             Some(GasOnArrivalRequest::Default) => q.push(("gasOnArrival", "true".to_string())),
             None => {}
         }
+        if p.gasless == Some(true) {
+            q.push(("gasless", "true".to_string()));
+        }
+        if let Some(v) = &p.referrer {
+            q.push(("referrer", v.clone()));
+        }
+        if let Some(v) = &p.copy_of {
+            q.push(("copyOf", v.clone()));
+        }
+        if let Some(v) = &p.purpose {
+            q.push(("purpose", v.clone()));
+        }
+        if let Some(v) = &p.split_id {
+            q.push(("splitId", v.clone()));
+        }
+        if let Some(v) = p.split_share {
+            q.push(("splitShare", v.to_string()));
+        }
+        if let Some(v) = &p.note {
+            q.push(("note", v.clone()));
+        }
         self.call(Method::GET, "/quote", &q, None).await
     }
 
-    /// `POST /v1/orders` — the transaction to sign for a quote. EVM txs may carry an `approval`.
+    /// `POST /v1/quote` — a quote by exact output with destination calls (D-029): the provider's
+    /// executor receives exactly `dst_amount` of `dst_token` and runs `calls` (or the `action`
+    /// preset) with it. Each quote reports `src_amount` (what `sender` pays) and `calls`. Only
+    /// providers that run destination calls answer; a call that would revert is `CALLS_REVERTED`.
+    pub async fn quote_calls(&self, p: &CallsQuoteParams) -> Result<QuoteResponse> {
+        let mut body = json!({
+            "srcChain": p.src_chain, "srcToken": p.src_token, "dstChain": p.dst_chain, "dstToken": p.dst_token,
+            "dstAmount": p.dst_amount, "sender": p.sender, "recipient": p.recipient,
+            "slippageBps": p.slippage_bps.unwrap_or(50), "channel": self.channel,
+        });
+        let o = body.as_object_mut().expect("object");
+        if let Some(c) = &p.calls {
+            o.insert("calls".into(), serde_json::to_value(c)?);
+        }
+        if let Some(a) = &p.action {
+            o.insert("action".into(), serde_json::to_value(a)?);
+        }
+        if let Some(i) = &self.integrator {
+            o.insert("integrator".into(), json!(i));
+        }
+        if let Some(bps) = self.integrator_fee_bps {
+            o.insert("integratorFeeBps".into(), json!(bps));
+        }
+        if let Some(v) = &p.referrer {
+            o.insert("referrer".into(), json!(v));
+        }
+        if let Some(v) = &p.copy_of {
+            o.insert("copyOf".into(), json!(v));
+        }
+        self.call(Method::POST, "/quote", &[], Some(body)).await
+    }
+
+    /// `POST /v1/orders` — the transaction to sign for a quote. EVM txs may carry an `approval`;
+    /// Tron txs ([`BuiltTx::Tvm`]) come prebuilt and unsigned. A gasless quote returns
+    /// [`Error::Usage`]: use [`LayerHop::build_gasless`].
     pub async fn build_tx(&self, quote_id: &str) -> Result<BuiltTx> {
         let r: BuildOrderResponse =
             self.call(Method::POST, "/orders", &[], Some(json!({ "quoteId": quote_id }))).await?;
-        Ok(r.tx)
+        match (r.tx, r.gasless) {
+            (Some(tx), _) => Ok(tx),
+            (None, Some(_)) => Err(Error::Usage("This quote is gasless; use build_gasless".to_string())),
+            (None, None) => Err(Error::Decode(serde::de::Error::missing_field("tx"))),
+        }
+    }
+
+    /// `POST /v1/orders` for a gasless quote: the EIP-712 typed data to sign with
+    /// `eth_signTypedData_v4` (`approval` when present, then `trade`), unchanged. Records the order.
+    /// The SDK never signs. A quote that is not gasless returns [`Error::Usage`]: use
+    /// [`LayerHop::build_tx`].
+    pub async fn build_gasless(&self, quote_id: &str) -> Result<GaslessSignRequest> {
+        let r: BuildOrderResponse =
+            self.call(Method::POST, "/orders", &[], Some(json!({ "quoteId": quote_id }))).await?;
+        r.gasless.ok_or_else(|| Error::Usage("This quote is not gasless; use build_tx".to_string()))
+    }
+
+    /// `POST /v1/orders/gasless` — send the wallet's signatures; the provider's relayer sends the
+    /// transaction and pays the gas out of the input token. `approval_signature` is required exactly
+    /// when the sign request had an `approval`. `GASLESS_PENDING` / `GASLESS_FAILED` on errors.
+    pub async fn submit_gasless(
+        &self,
+        quote_id: &str,
+        trade_signature: &str,
+        approval_signature: Option<&str>,
+    ) -> Result<GaslessOrderStatus> {
+        let mut signatures = json!({ "trade": trade_signature });
+        if let Some(a) = approval_signature {
+            signatures["approval"] = json!(a);
+        }
+        self.call(
+            Method::POST,
+            "/orders/gasless",
+            &[],
+            Some(json!({ "quoteId": quote_id, "signatures": signatures })),
+        )
+        .await
+    }
+
+    /// `GET /v1/orders/gasless/{quoteId}` — the gasless order's state; poll every few seconds until
+    /// `filled` or `failed`.
+    pub async fn gasless_status(&self, quote_id: &str) -> Result<GaslessOrderStatus> {
+        let path = format!("/orders/gasless/{}", urlencoding::encode(quote_id));
+        self.call(Method::GET, &path, &[], None).await
     }
 
     /// `POST /v1/orders/submit` — for [`SvmTx`] with `submit_via_api`: forward the wallet-signed
@@ -331,6 +507,32 @@ impl LayerHop {
     /// keys always work and can `simulate` fills.
     pub fn limit_orders(&self) -> LimitOrders<'_> {
         LimitOrders { client: self }
+    }
+
+    /// Solana recurring buys (beta, Jupiter Recurring, no LayerHop fee). `create` returns an
+    /// unsigned tx: have the wallet sign it (sign only), then `submit` it with the `request_id`;
+    /// `cancel` works the same way. The SDK never signs.
+    pub fn recurring_orders(&self) -> RecurringOrders<'_> {
+        RecurringOrders { client: self }
+    }
+
+    /// Split bills (public, no key): one recipient is owed a total, paid in shares by quotes with
+    /// [`QuoteParams::split_id`] / [`QuoteParams::split_share`].
+    pub fn splits(&self) -> Splits<'_> {
+        Splits { client: self }
+    }
+
+    /// Bulk payouts (public, no key): check and group rows, then build plain transfers. The SDK
+    /// never signs; routed rows are quoted with `purpose: "payout"`.
+    pub fn payouts(&self) -> Payouts<'_> {
+        Payouts { client: self }
+    }
+
+    /// `GET /v1/tip-jars/{address}` — public tip jar counters: distinct tippers, filled tips and
+    /// the latest 10 messages (tips are quotes with `purpose: "tip"`).
+    pub async fn get_tip_jar(&self, address: &str) -> Result<TipJar> {
+        let path = format!("/tip-jars/{}", urlencoding::encode(address));
+        self.call(Method::GET, &path, &[], None).await
     }
 
     /// `GET /v1/status` — public service status (status.layerhop.com): overall state, per-component
@@ -772,6 +974,109 @@ impl LimitOrders<'_> {
     }
 }
 
+/// Recurring order endpoints, from [`LayerHop::recurring_orders`].
+#[derive(Debug, Clone, Copy)]
+pub struct RecurringOrders<'a> {
+    client: &'a LayerHop,
+}
+
+impl RecurringOrders<'_> {
+    /// `POST /v1/recurring-orders` — build an order: `amount` is spent in `orders` equal buys, one
+    /// every `interval_seconds`. Sign `tx` with `wallet` (sign only), then
+    /// [`RecurringOrders::submit`] it with `request_id`. Live mode may be disabled by the operator
+    /// (`FORBIDDEN`); test keys always work.
+    pub async fn create(&self, p: &CreateRecurringOrderParams) -> Result<RecurringOrderBuild> {
+        self.client.call(Method::POST, "/recurring-orders", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `POST /v1/recurring-orders/submit` — send the wallet-signed create or cancel tx (base64) with
+    /// the `request_id` it was built with.
+    pub async fn submit(&self, request_id: &str, signed_transaction: &str) -> Result<SubmitRecurringOrderResponse> {
+        self.client
+            .call(
+                Method::POST,
+                "/recurring-orders/submit",
+                &[],
+                Some(json!({ "requestId": request_id, "signedTransaction": signed_transaction })),
+            )
+            .await
+    }
+
+    /// `GET /v1/recurring-orders` — a wallet's orders, `active` (default) or `history`, 10 per page.
+    pub async fn list(&self, p: &ListRecurringOrdersParams) -> Result<ListRecurringOrdersResponse> {
+        let mut q: Vec<(&str, String)> = vec![("wallet", p.wallet.clone())];
+        if let Some(v) = &p.status {
+            q.push(("status", v.clone()));
+        }
+        if let Some(v) = p.page {
+            q.push(("page", v.to_string()));
+        }
+        self.client.call(Method::GET, "/recurring-orders", &q, None).await
+    }
+
+    /// `POST /v1/recurring-orders/{id}/cancel` — the cancel tx for an active order (`id` is the
+    /// order account): sign it and [`RecurringOrders::submit`] it with `request_id`.
+    pub async fn cancel(&self, id: &str, wallet: &str) -> Result<CancelRecurringOrderResponse> {
+        let path = format!("/recurring-orders/{}/cancel", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({ "wallet": wallet }))).await
+    }
+}
+
+/// Split endpoints, from [`LayerHop::splits`]. Public, no key.
+#[derive(Debug, Clone, Copy)]
+pub struct Splits<'a> {
+    client: &'a LayerHop,
+}
+
+impl Splits<'_> {
+    /// `POST /v1/splits` — create a split. The response carries `edit_token`, shown only once:
+    /// keep it to [`Splits::update`] the split.
+    pub async fn create(&self, p: &CreateSplitParams) -> Result<SplitCreated> {
+        self.client.call(Method::POST, "/splits", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `GET /v1/splits/{id}` — the split and each share's status.
+    pub async fn get(&self, id: &str) -> Result<Split> {
+        let path = format!("/splits/{}", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
+    }
+
+    /// `PATCH /v1/splits/{id}` — rename shares, change or clear the note, close or reopen. Sends
+    /// `edit_token` as `x-edit-token` (`UNAUTHORIZED` without it, `FORBIDDEN` when wrong).
+    pub async fn update(&self, id: &str, edit_token: &str, p: &UpdateSplitParams) -> Result<Split> {
+        let path = format!("/splits/{}", urlencoding::encode(id));
+        self.client
+            .call_with_headers(
+                Method::PATCH,
+                &path,
+                &[],
+                Some(serde_json::to_value(p)?),
+                &[("x-edit-token", edit_token)],
+            )
+            .await
+    }
+}
+
+/// Payout endpoints, from [`LayerHop::payouts`]. Public, no key. The SDK never signs.
+#[derive(Debug, Clone, Copy)]
+pub struct Payouts<'a> {
+    client: &'a LayerHop,
+}
+
+impl Payouts<'_> {
+    /// `POST /v1/payouts/plan` — check up to 100 rows (`rows` or `csv`, amounts in human units) and
+    /// group the valid ones into plain `transfers` and `routes`. A bad row never fails the request.
+    pub async fn plan(&self, p: &PayoutPlanParams) -> Result<PayoutPlan> {
+        self.client.call(Method::POST, "/payouts/plan", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `POST /v1/payouts/transfers` — the unsigned transfers of one batch: EVM `calls` (send them in
+    /// order) or one Solana `serialized_tx` for the sender to sign.
+    pub async fn transfers(&self, p: &PayoutTransfersParams) -> Result<PayoutTransfers> {
+        self.client.call(Method::POST, "/payouts/transfers", &[], Some(serde_json::to_value(p)?)).await
+    }
+}
+
 /// Checkout product endpoints, from [`Checkout::products`].
 #[derive(Debug, Clone, Copy)]
 pub struct CheckoutProducts<'a> {
@@ -856,9 +1161,9 @@ async fn api_error(res: reqwest::Response) -> Error {
         Err(e) => return Error::Http(e),
     };
     let parsed = serde_json::from_slice::<ErrorEnvelope>(&bytes).ok().and_then(|e| e.error);
-    let (code, message, request_id) = match parsed {
-        Some(e) => (e.code, e.message, e.request_id),
-        None => (None, None, None),
+    let (code, message, request_id, details) = match parsed {
+        Some(e) => (e.code, e.message, e.request_id, e.details.filter(|d| d.is_object())),
+        None => (None, None, None, None),
     };
     Error::Api {
         code: code.unwrap_or_else(|| "INTERNAL".to_string()),
@@ -866,6 +1171,7 @@ async fn api_error(res: reqwest::Response) -> Error {
             .unwrap_or_else(|| status.canonical_reason().unwrap_or("request failed").to_string()),
         status: status.as_u16(),
         request_id: request_id.or(header_request_id),
+        details,
     }
 }
 

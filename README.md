@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/layerhop?color=c3f06b&labelColor=090d15&cacheSeconds=3600)](https://crates.io/crates/layerhop) [![docs.rs](https://img.shields.io/docsrs/layerhop?labelColor=090d15)](https://docs.rs/layerhop) [![license](https://img.shields.io/crates/l/layerhop?color=7ddec8&labelColor=090d15)](https://opensource.org/license/mit)
 
 Async Rust client for the [LayerHop](https://docs.layerhop.com) API: best-price cross-chain and
-same-chain swaps (EVM ↔ Solana) through one non-custodial API. It mirrors the TypeScript SDK
+same-chain swaps (EVM, Solana and Tron) through one non-custodial API. It mirrors the TypeScript SDK
 (`@layerhop/sdk`).
 
 - Built on `reqwest` (rustls, no OpenSSL) and `tokio`. Models use `serde`.
@@ -45,7 +45,7 @@ async fn main() -> layerhop::Result<()> {
             sender: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".into(),
             recipient: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".into(),
             slippage_bps: Some(50),
-            gas_on_arrival: None,
+            ..Default::default() // gas on arrival, gasless, referrer, purpose, ...
         })
         .await?;
     let best = &quotes.best;
@@ -69,12 +69,17 @@ async fn main() -> layerhop::Result<()> {
             // Otherwise send it through your RPC.
             todo!("sign {svm:?} with your Solana wallet")
         }
+        BuiltTx::Tvm(tron) => {
+            // Sign tron.unsigned (and tron.approval first, when Some) unchanged with a Tron wallet,
+            // broadcast, and return the main transaction's txID (bare 64-hex).
+            todo!("sign {tron:?} with your Tron wallet")
+        }
     };
 
     // 4. Tell LayerHop you broadcast it (enables order tracking and webhooks). Idempotent.
     lh.report_submitted(&best.quote_id, &tx_hash).await?;
 
-    // 5. Watch until filled / refunded / failed.
+    // 5. Watch until filled / refunded / failed / dropped.
     let mut updates = Box::pin(lh.watch(&best.provider, &tx_hash, WatchOptions::default()));
     while let Some(status) = updates.next().await {
         println!("{}", status?.state);
@@ -89,9 +94,18 @@ async fn main() -> layerhop::Result<()> {
 |---|---|
 | `health()` | `GET /v1/health` |
 | `chains()` | `GET /v1/chains` |
-| `tokens(chain)` | `GET /v1/tokens?chain=` |
+| `tokens(chain)` | `GET /v1/tokens?chain=` (first page) |
+| `search_tokens(&TokenSearchParams)` | `GET /v1/tokens?chain=&q=&limit=&cursor=` → `TokensPage` |
+| `lookup_token(address, Option<chain>)` | `GET /v1/tokens/lookup` (without a chain the API finds it) |
+| `get_token_risk(chain, address)` | `GET /v1/tokens/{chain}/{address}/risk` |
+| `prices(&[ids])` | `GET /v1/prices?ids=chainId:address,...` |
+| `balances(&BalancesParams)` | `GET /v1/balances?address=&chains=&tokens=&fresh=` |
 | `quote(&QuoteParams)` | `GET /v1/quote` |
-| `build_tx(quote_id)` | `POST /v1/orders` |
+| `quote_calls(&CallsQuoteParams)` | `POST /v1/quote` (exact output + destination calls) |
+| `build_tx(quote_id)` | `POST /v1/orders` → `BuiltTx::Evm` / `Svm` / `Tvm` |
+| `build_gasless(quote_id)` | `POST /v1/orders` for a gasless quote → `GaslessSignRequest` |
+| `submit_gasless(quote_id, trade_sig, Option<approval_sig>)` | `POST /v1/orders/gasless` |
+| `gasless_status(quote_id)` | `GET /v1/orders/gasless/{quoteId}` |
 | `submit(quote_id, signed_base64)` | `POST /v1/orders/submit` (Solana `submit_via_api` only) |
 | `report_submitted(quote_id, tx_hash)` | `POST /v1/orders/{quoteId}/submitted` |
 | `simulate(quote_id)` | `POST /v1/simulate` |
@@ -140,6 +154,16 @@ async fn main() -> layerhop::Result<()> {
 | `limit_orders().get(id)` | `GET /v1/limit-orders/{id}` (with its `fills`) |
 | `limit_orders().cancel(id)` | `POST /v1/limit-orders/{id}/cancel` |
 | `limit_orders().simulate(id, outcome)` | `POST /v1/limit-orders/{id}/simulate` (test keys only) |
+| `recurring_orders().create(&CreateRecurringOrderParams)` | `POST /v1/recurring-orders` |
+| `recurring_orders().submit(request_id, signed_base64)` | `POST /v1/recurring-orders/submit` |
+| `recurring_orders().list(&ListRecurringOrdersParams)` | `GET /v1/recurring-orders?wallet=&status=&page=` |
+| `recurring_orders().cancel(id, wallet)` | `POST /v1/recurring-orders/{id}/cancel` |
+| `splits().create(&CreateSplitParams)` | `POST /v1/splits` (public) |
+| `splits().get(id)` | `GET /v1/splits/{id}` (public) |
+| `splits().update(id, edit_token, &UpdateSplitParams)` | `PATCH /v1/splits/{id}` (`x-edit-token`) |
+| `get_tip_jar(address)` | `GET /v1/tip-jars/{address}` (public) |
+| `payouts().plan(&PayoutPlanParams)` | `POST /v1/payouts/plan` (public) |
+| `payouts().transfers(&PayoutTransfersParams)` | `POST /v1/payouts/transfers` (public) |
 | `service_status()` | `GET /v1/status` (public) |
 | `webhooks().stream()` | `GET /v1/webhooks/stream` (SSE, API key) |
 | `webhooks().trigger(event_type)` | `POST /v1/webhooks/trigger` (test keys only) |
@@ -488,6 +512,155 @@ for c in &st.components {
 }
 ```
 
+## Tron transactions
+
+Where the API runs with Tron enabled (D-048), chains may have `vm: "tvm"` and `build_tx` returns
+`BuiltTx::Tvm(TronTx)` (chain id `layerhop::TRON_CHAIN_ID`, 728126428). The SDK never signs:
+
+- `tx.unsigned` is the transaction exactly as the node built it (`tx_id`, `raw_data_hex`, and
+  `raw_data` kept as a raw `serde_json::Value`). Sign it unchanged with a Tron wallet (TronWeb,
+  TronLink) and broadcast it before `raw_data.expiration`.
+- When `tx.approval` is `Some`, send that TRC-20 approval (its own `unsigned`) first.
+- Report the main transaction's `tx_id` (bare 64-hex, no `0x`) with `report_submitted`.
+
+`simulate` reports `energy_used` for Tron.
+
+## Gasless swaps
+
+For a wallet with no native gas: an ERC-20 input swapped on the same EVM chain, where the
+provider's relayer pays the network fee out of the input token (`quote.gasless.gas_fee`). The user
+signs EIP-712 typed data instead of sending a transaction. Live mode only.
+
+```rust
+let q = lh.quote(&QuoteParams { gasless: Some(true), ..params }).await?;
+let req = lh.build_gasless(&q.best.quote_id).await?; // req.approval (optional), req.trade
+// Sign req.trade.eip712 (and req.approval's, when Some) with eth_signTypedData_v4, unchanged.
+let st = lh.submit_gasless(&q.best.quote_id, &trade_sig, approval_sig.as_deref()).await?;
+let st = lh.gasless_status(&q.best.quote_id).await?; // poll until "filled" or "failed"
+```
+
+`build_tx` on a gasless quote returns `Error::Usage` (and `build_gasless` on a regular one).
+Errors to expect: `GASLESS_PENDING`, `GASLESS_FAILED`, `QUOTE_EXPIRED`. Guide:
+https://docs.layerhop.com/guides/gasless-swaps
+
+## Destination calls
+
+`quote_calls` quotes by exact output and runs contract calls on the destination chain with it
+(for example bridge USDC and supply it to Aave for `recipient`). Each quote reports `src_amount`
+(what `sender` pays) and `calls` (the committed calls, the executor and the simulation).
+
+```rust
+use layerhop::{CallsQuoteParams, DestinationAction};
+
+let q = lh
+    .quote_calls(&CallsQuoteParams {
+        src_chain: "base".into(),
+        src_token: "USDC".into(),
+        dst_chain: "arbitrum".into(),
+        dst_token: "USDC".into(),
+        dst_amount: "10000000".into(), // exactly 10 USDC reach the calls
+        sender: "0x...".into(),
+        recipient: "0x...".into(),
+        action: Some(DestinationAction::aave_v3_supply()), // or calls: Some(vec![DestinationCall { .. }])
+        ..Default::default()
+    })
+    .await?;
+```
+
+The calls run from the provider's executor (`msg.sender`), so targets must credit `recipient` from a
+parameter. A call that would revert fails the quote with `CALLS_REVERTED`. Guide:
+https://docs.layerhop.com/guides/destination-calls
+
+## Tokens, prices and balances
+
+```rust
+use layerhop::{BalancesParams, TokenSearchParams};
+
+let page = lh
+    .search_tokens(&TokenSearchParams { chain: "berachain".into(), q: Some("HONEY".into()), ..Default::default() })
+    .await?; // page.tokens, page.next_cursor
+let weth = lh.lookup_token("0x4200000000000000000000000000000000000006", None).await?; // chain found by the API
+let risk = lh.get_token_risk("base", &weth.address).await?; // risk.level: ok | caution | danger | unknown
+let prices = lh.prices(&["8453:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]).await?;
+let b = lh.balances(&BalancesParams { address: "0x...".into(), fresh: true, ..Default::default() }).await?;
+```
+
+Tokens read on-chain have `verified: false`: show a warning before a user trades them. Show a
+`danger` risk prominently; `unknown` means no source answered and should never block a swap.
+`Chain` carries `destination_only`, `only_route` and `route_health` for pickers. Guide:
+https://docs.layerhop.com/guides/tokens-and-balances
+
+## Splits, tip jars and payouts
+
+All public (no key). The SDK never signs anything.
+
+```rust
+use layerhop::{CreateSplitParams, PayoutPlanParams, UpdateSplitParams};
+
+let s = lh
+    .splits()
+    .create(&CreateSplitParams {
+        recipient: "alice.eth".into(),
+        chain: "base".into(),
+        token: "USDC".into(),
+        total: "120000000".into(),
+        participants: Some(3),
+        ..Default::default()
+    })
+    .await?; // keep s.edit_token: it is shown only once
+// Pay share 0: a quote with purpose: Some("split"), split_id: Some(s.split.id), split_share: Some(0)
+let split = lh.splits().get(&s.split.id).await?; // split.shares[i].status: unpaid | partial | paid
+lh.splits()
+    .update(&s.split.id, &s.edit_token, &UpdateSplitParams { status: Some("closed".into()), ..Default::default() })
+    .await?; // note: Some(None) clears the note
+
+let jar = lh.get_tip_jar("0x...").await?; // jar.tippers, jar.tips, jar.messages (tips: purpose "tip")
+
+let plan = lh
+    .payouts()
+    .plan(&PayoutPlanParams {
+        src_chain: "base".into(),
+        src_token: "USDC".into(),
+        sender: "0x...".into(),
+        csv: Some("recipient,amount,token,chain\nalice.eth,250,USDC,base".into()),
+        ..Default::default()
+    })
+    .await?;
+// plan.transfers: build each batch with lh.payouts().transfers(..) and sign the calls / serialized_tx;
+// plan.routes: quote each row with purpose: Some("payout")
+```
+
+Guides: https://docs.layerhop.com/guides/split-the-bill, https://docs.layerhop.com/guides/tip-jar,
+https://docs.layerhop.com/guides/bulk-payouts
+
+## Recurring orders
+
+Solana recurring buys (beta, Jupiter Recurring, no LayerHop fee): `amount` is spent in `orders`
+equal buys, one every `interval_seconds`.
+
+```rust
+use layerhop::{CreateRecurringOrderParams, ListRecurringOrdersParams};
+
+let b = lh
+    .recurring_orders()
+    .create(&CreateRecurringOrderParams {
+        wallet: "9WzD...".into(),
+        dst_token: "SOL".into(),
+        amount: "350000000".into(), // 350 USDC
+        orders: 7,
+        interval_seconds: 86_400, // daily
+        ..Default::default()
+    })
+    .await?;
+// sign b.tx.serialized_tx with the wallet (sign only), then:
+let r = lh.recurring_orders().submit(&b.request_id, &signed_base64).await?; // r.order: the order account
+let list = lh
+    .recurring_orders()
+    .list(&ListRecurringOrdersParams { wallet: "9WzD...".into(), ..Default::default() })
+    .await?;
+let c = lh.recurring_orders().cancel(&list.recurring_orders[0].id, "9WzD...").await?; // sign c.tx, submit with c.request_id
+```
+
 ## Test mode
 
 Use an `lh_test_` key exactly like a live key. Every request is served by the `sandbox` provider,
@@ -499,14 +672,40 @@ through the sandbox too. See the [test mode guide](https://docs.layerhop.com/gui
 
 ## Errors
 
-Every non-2xx response becomes `layerhop::Error::Api { code, message, status, request_id }`, where
-`code` is a stable error code (`QUOTE_EXPIRED`, `NO_ROUTE`, ...) documented at
-`https://docs.layerhop.com/errors/{code}`. `err.code()` returns it. Transport failures are
-`Error::Http`, unexpected bodies `Error::Decode`, and `watch` timeouts `Error::Timeout`.
+Every non-2xx response becomes `layerhop::Error::Api { code, message, status, request_id, details }`,
+where `code` is a stable error code (`QUOTE_EXPIRED`, `NO_ROUTE`, ...) documented at
+`https://docs.layerhop.com/errors/{code}` and `details` is the raw `error.details` JSON (on some
+errors only). `err.code()` returns the code. Transport failures are `Error::Http`, unexpected bodies
+`Error::Decode`, `watch` timeouts `Error::Timeout`, and a call that doesn't fit the quote
+(`build_tx` on a gasless quote) `Error::Usage`.
 
 ```rust
 match lh.build_tx(&quote_id).await {
     Err(e) if e.code() == Some("QUOTE_EXPIRED") => { /* re-quote */ }
+    other => { other?; }
+}
+```
+
+### Route suggestions and minimums
+
+A live `NO_ROUTE` (and `UNSUPPORTED_CHAIN` into a route-restricted chain such as Blast) may carry
+alternatives that did quote. `err.suggestions()` returns them validated (malformed entries dropped,
+at most 4): `kind` `dst_token` (another destination token), `src_token` (pay with another token) or
+`via_hub` (two signed steps through `hub`, in `steps`). `err.amount_too_small()` reads the route's
+minimum on `AMOUNT_TOO_SMALL`, and `err.provider_errors()` why each provider had no quote.
+
+```rust
+match lh.quote(&params).await {
+    Err(e) if e.code() == Some("NO_ROUTE") => {
+        for s in e.suggestions() {
+            println!("{}: quote {} -> {} again", s.message, s.src_chain, s.dst_chain);
+        }
+    }
+    Err(e) if e.code() == Some("AMOUNT_TOO_SMALL") => {
+        if let Some(m) = e.amount_too_small().and_then(|d| d.min_amount) {
+            println!("send at least {m} base units");
+        }
+    }
     other => { other?; }
 }
 ```
@@ -528,7 +727,7 @@ webhook::verify(&secret, &raw_body, signature_header)?; // default 300 s toleran
 With an API key, `webhooks().stream()` yields your account's webhook events (in the key's live or
 test mode) as `WebhookEvent`s as they are created. `webhooks().trigger(event_type)` creates a
 sample event in test mode (test keys only; a live key returns `Error::Api` with `FORBIDDEN`).
-Event types: `order.*` (`submitted`, `filled`, `refunded`, `failed`), `checkout.session.*`
+Event types: `order.*` (`submitted`, `filled`, `refunded`, `failed`, `dropped`), `checkout.session.*`
 (`processing`, `completed`, `payment_failed`, `expired`, `refunded`), `invoice.sent`,
 `invoice.paid`, `subscription.*` (`created`, `renewed`, `past_due`, `canceled`) and
 `limit_order.*` (`opened`, `filled`, `cancelled`, `expired`, `failed`).

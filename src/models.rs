@@ -26,20 +26,83 @@ pub struct Chain {
     pub id: u64,
     pub slug: String,
     pub name: String,
-    /// `evm` or `svm`.
+    /// `evm`, `svm` (Solana) or `tvm` (Tron, where the API runs with Tron enabled).
     pub vm: String,
     pub native_symbol: String,
     pub native_decimals: u32,
     pub explorer_tx: String,
+    #[serde(default, rename = "logoURI", skip_serializing_if = "Option::is_none")]
+    pub logo_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explorer_address: Option<String>,
+    /// Providers that can route from or to this chain.
+    #[serde(default)]
+    pub providers: Vec<ProviderId>,
+    /// Shown first in chain pickers.
+    #[serde(default)]
+    pub popular: bool,
+    /// `Some(true)` for chains you can deliver to but not send from (Hyperliquid, Blast). Hide them
+    /// from source pickers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_only: Option<bool>,
+    /// Present when every provider of this chain serves one fixed route into it (Blast: ETH on
+    /// Ethereum → ETH on Blast). Quotes into the chain from anything else are `UNSUPPORTED_CHAIN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_route: Option<OnlyRoute>,
+    /// Result of LayerHop's periodic read-only probe quotes into and out of the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_health: Option<ChainRouteHealth>,
+}
+
+/// The one route into a [`Chain::only_route`] chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnlyRoute {
+    pub src_chain_id: u64,
+    /// Source token address (EVM native = `0x000…000`).
+    pub src_token: String,
+    /// Destination token address on this chain.
+    pub dst_token: String,
+}
+
+/// [`Chain::route_health`]. Strings so new values never break decoding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainRouteHealth {
+    /// Into the chain: `ok` · `failing` · `unknown`.
+    #[serde(rename = "in")]
+    pub inbound: String,
+    /// Out of the chain: `ok` · `failing` · `unknown`.
+    #[serde(rename = "out")]
+    pub outbound: String,
+    /// `ok` · `deposit_only` · `withdraw_only` · `unavailable` · `unknown`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Token {
     pub chain_id: u64,
+    /// Address or mint. EVM native coin: `0x000…000`; native SOL: the wrapped-SOL mint.
     pub address: String,
     pub symbol: String,
+    #[serde(default)]
+    pub name: String,
     pub decimals: u32,
+    #[serde(default, rename = "logoURI", skip_serializing_if = "Option::is_none")]
+    pub logo_uri: Option<String>,
+    /// USD price when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_usd: Option<f64>,
+    /// On a provider list or LayerHop's curated list; `false` for tokens read on-chain only. Show a
+    /// warning before a user trades an unverified token.
+    #[serde(default)]
+    pub verified: bool,
+    /// Stables, wrapped native and majors (the canonical one per symbol and chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub popular: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,9 +110,130 @@ pub(crate) struct ChainsResponse {
     pub chains: Vec<Chain>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct TokensResponse {
+/// One page of [`crate::LayerHop::search_tokens`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokensPage {
+    #[serde(default)]
     pub tokens: Vec<Token>,
+    /// Pass as [`TokenSearchParams::cursor`] for the next page; `None` on the last page.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// Parameters for [`crate::LayerHop::search_tokens`] (`GET /v1/tokens`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TokenSearchParams {
+    /// Chain id or slug.
+    pub chain: String,
+    /// Symbol, name or address. An unlisted address is read on-chain (`verified: false`).
+    pub q: Option<String>,
+    /// Page size, 1–200 (default 50).
+    pub limit: Option<u32>,
+    /// [`TokensPage::next_cursor`] of the previous page.
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TokenLookupResponse {
+    pub token: Token,
+}
+
+/// One reason in a [`TokenRisk`] report. Strings so new codes never break decoding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenRiskReason {
+    /// `honeypot`, `sell_tax`, `fake_symbol`, `mintable`, ... (see the API reference).
+    pub code: String,
+    /// `caution` or `danger`.
+    pub level: String,
+    /// One plain sentence for the user.
+    pub message: String,
+    /// Percent for `buy_tax` / `sell_tax` / `transfer_fee`; holder count for `few_holders`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+}
+
+/// A token's safety report, from [`crate::LayerHop::get_token_risk`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenRisk {
+    pub chain_id: u64,
+    pub address: String,
+    /// `ok` · `caution` · `danger` · `unknown` (no source answered; never block a swap on it).
+    pub level: String,
+    /// A major LayerHop lists itself; never checked upstream.
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub reasons: Vec<TokenRiskReason>,
+    /// `list` · `goplus` · `none`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TokenRiskResponse {
+    pub risk: TokenRisk,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PricesResponse {
+    #[serde(default)]
+    pub prices: BTreeMap<String, f64>,
+}
+
+/// Parameters for [`crate::LayerHop::balances`] (`GET /v1/balances`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BalancesParams {
+    /// EVM address or Solana wallet.
+    pub address: String,
+    /// Chain ids or slugs (at most 25), all of the address's VM. Default: popular EVM chains, or
+    /// Solana for a Solana address.
+    pub chains: Option<Vec<String>>,
+    /// `chainId:address` entries (at most 20) always returned, even at zero.
+    pub tokens: Option<Vec<String>>,
+    /// Reload balances cached more than 4 seconds ago (sent as `fresh=1`).
+    pub fresh: bool,
+}
+
+/// A wallet balance: the token plus the amount held.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Balance {
+    #[serde(flatten)]
+    pub token: Token,
+    /// Base units.
+    pub amount: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_usd: Option<f64>,
+}
+
+/// A chain (or requested token) that could not be read in [`BalancesResponse`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceError {
+    pub chain_id: u64,
+    pub message: String,
+}
+
+/// Response of [`crate::LayerHop::balances`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalancesResponse {
+    pub address: String,
+    pub vm: String,
+    /// Highest USD value first.
+    #[serde(default)]
+    pub balances: Vec<Balance>,
+    #[serde(default)]
+    pub total_usd: f64,
+    #[serde(default)]
+    pub errors: Vec<BalanceError>,
 }
 
 /// Parameters for [`crate::LayerHop::quote`].
@@ -71,6 +255,168 @@ pub struct QuoteParams {
     /// swaps, non-EVM destinations and native outputs; providers that can't do it ignore it
     /// (check [`Quote::gas_on_arrival`]).
     pub gas_on_arrival: Option<GasOnArrivalRequest>,
+    /// Gasless swap (sent as `gasless=true`): the user signs EIP-712 typed data and the provider's
+    /// relayer pays the network fee out of `src_token`. ERC-20 input, same EVM chain, live mode only.
+    /// Then [`crate::LayerHop::build_gasless`] → sign → [`crate::LayerHop::submit_gasless`].
+    pub gasless: Option<bool>,
+    /// Wallet that referred the user (attribution only; invalid values are ignored).
+    pub referrer: Option<String>,
+    /// Copy this trade: a trade card (`q_…`) or the copied wallet (attribution only).
+    pub copy_of: Option<String>,
+    /// What the payment is for: `tip` · `split` · `payout` · `gather` · `rebalance` · `fund`.
+    /// Attribution only; never changes the fee or the route.
+    pub purpose: Option<String>,
+    /// Pay one share of a split ([`crate::Splits::create`]), with `split_share`.
+    pub split_id: Option<String>,
+    /// The share's `index` in the split (from 0).
+    pub split_share: Option<u32>,
+    /// A message to the recipient on a tip or split payment (kept to 140 characters).
+    pub note: Option<String>,
+}
+
+/// One contract call on the destination chain. `msg.sender` is the provider's executor, not the
+/// user: targets must credit `recipient` from a parameter.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DestinationCall {
+    pub to: String,
+    /// ABI-encoded calldata (`0x` hex).
+    pub data: String,
+    /// Wei sent with the call (default `"0"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+/// A preset that builds the destination calls server-side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DestinationAction {
+    /// `aave-v3-supply`.
+    #[serde(rename = "type")]
+    pub action_type: String,
+}
+
+impl DestinationAction {
+    /// Approve the chain's Aave v3 Pool and supply `dst_amount` of `dst_token` for `recipient`.
+    pub fn aave_v3_supply() -> Self {
+        Self { action_type: "aave-v3-supply".to_string() }
+    }
+}
+
+/// Parameters for [`crate::LayerHop::quote_calls`] (`POST /v1/quote`): a quote by exact output
+/// that runs destination calls with it. Send `calls` or `action`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CallsQuoteParams {
+    pub src_chain: String,
+    pub src_token: String,
+    pub dst_chain: String,
+    pub dst_token: String,
+    /// Exact base units of `dst_token` the calls receive. Each quote reports `src_amount`.
+    pub dst_amount: String,
+    pub sender: String,
+    pub recipient: String,
+    /// Defaults to 50.
+    pub slippage_bps: Option<u32>,
+    /// At most 8, run in order by the provider's executor.
+    pub calls: Option<Vec<DestinationCall>>,
+    pub action: Option<DestinationAction>,
+    pub referrer: Option<String>,
+    pub copy_of: Option<String>,
+}
+
+/// The destination calls of a quote, as the provider committed to them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DestinationCallsPlan {
+    #[serde(default)]
+    pub items: Vec<DestinationCall>,
+    /// The contract that receives the output and makes the calls (their `msg.sender`).
+    pub executor: String,
+    #[serde(default)]
+    pub executed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation: Option<CallsSimulation>,
+}
+
+/// The mandatory pre-quote simulation of a [`DestinationCallsPlan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallsSimulation {
+    pub ok: bool,
+    /// Gas the calls used together (decimal string; numbers are accepted too).
+    #[serde(default, deserialize_with = "string_or_number")]
+    pub gas_used: Option<String>,
+    /// ERC-20 output left in the executor after the calls; anything above 0 is lost to you.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leftover: Option<String>,
+}
+
+/// Network fee a gasless relayer takes from the input token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GasFee {
+    /// Base units of `token`.
+    pub amount: String,
+    pub token: String,
+}
+
+/// [`Quote::gasless`]: on gasless quotes only. `dst_amount` already accounts for the gas fee.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GaslessQuoteInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_fee: Option<GasFee>,
+    /// `true` when the wallet signs a gasless approval (permit) before the trade: two signatures.
+    #[serde(default)]
+    pub approval: bool,
+}
+
+/// EIP-712 typed data exactly as the provider returned it. Sign it unchanged
+/// (`eth_signTypedData_v4`); `types`, `domain` and `message` are kept as raw JSON for that reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Eip712TypedData {
+    pub types: serde_json::Value,
+    pub domain: serde_json::Value,
+    pub message: serde_json::Value,
+    pub primary_type: String,
+}
+
+/// One thing to sign for a gasless order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GaslessSignable {
+    /// The provider's kind, e.g. `permit` (approval) or `settler_metatransaction` (trade).
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub eip712: Eip712TypedData,
+}
+
+/// What the wallet signs for a gasless quote, from [`crate::LayerHop::build_gasless`]: `approval`
+/// (when present), then `trade`, on `chain_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GaslessSignRequest {
+    pub chain_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<GaslessSignable>,
+    pub trade: GaslessSignable,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_fee: Option<GasFee>,
+}
+
+/// State of a submitted gasless order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GaslessOrderStatus {
+    pub quote_id: String,
+    pub provider: ProviderId,
+    /// Provider order id (0x: the trade's EIP-712 hash).
+    pub order_id: String,
+    /// An order state: `pending` · `filled` · `failed` · ...
+    pub state: String,
+    /// The relayer's transaction, once mined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_tx_hash: Option<String>,
+    /// Provider failure reason when `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// How much native gas [`QuoteParams::gas_on_arrival`] asks for.
@@ -128,6 +474,15 @@ pub struct Quote {
     /// Native gas delivered to the recipient on top of `dst_amount` (when requested and included).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gas_on_arrival: Option<GasOnArrival>,
+    /// What `sender` pays, fees included (destination-call quotes, by exact output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_amount: Option<String>,
+    /// The destination calls and their simulation ([`crate::LayerHop::quote_calls`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<DestinationCallsPlan>,
+    /// On gasless quotes only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gasless: Option<GaslessQuoteInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -200,18 +555,89 @@ pub struct SvmTx {
     pub sandbox: Option<bool>,
 }
 
+/// One Tron smart-contract call (`TriggerSmartContract`). Addresses are base58 T-addresses;
+/// amounts are sun (1 TRX = 1,000,000 sun).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TronCall {
+    pub to: String,
+    /// ABI calldata, `0x` hex.
+    pub data: String,
+    /// TRX sent with the call, sun.
+    pub value: String,
+    /// `fee_limit` in sun: the most TRX the network may burn for this call's energy.
+    pub fee_limit: String,
+}
+
+/// An unsigned Tron transaction exactly as the node built it (TronWeb's transaction object). Sign
+/// it unchanged and broadcast it before `raw_data.expiration`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TronUnsignedTx {
+    /// The tx hash once broadcast: bare 64-hex, no `0x`.
+    #[serde(rename = "txID")]
+    pub tx_id: String,
+    /// Protobuf-encoded raw transaction (what gets signed).
+    pub raw_data_hex: String,
+    /// Decoded `raw_data` (contract, ref block, expiration, fee_limit), kept as raw JSON so it
+    /// goes to your Tron wallet unchanged.
+    pub raw_data: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible: Option<bool>,
+}
+
+/// TRC-20 approval to send before [`TronTx::call`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TronApproval {
+    pub token: String,
+    pub spender: String,
+    /// Base units.
+    pub amount: String,
+    pub call: TronCall,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsigned: Option<TronUnsignedTx>,
+}
+
+/// Tron transaction(s) for a quote (D-048). The SDK never signs: sign `unsigned` unchanged with a
+/// Tron wallet (TronWeb / TronLink), send `approval` first when present, broadcast each before
+/// `raw_data.expiration`, then [`crate::LayerHop::report_submitted`] with the main transaction's
+/// `tx_id` (bare 64-hex).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TronTx {
+    /// Always [`crate::TRON_CHAIN_ID`].
+    pub chain_id: u64,
+    /// Owner (signer) of every call, T-address.
+    pub from: String,
+    pub call: TronCall,
+    /// The main call prebuilt (absent in test mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsigned: Option<TronUnsignedTx>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<TronApproval>,
+    /// Test mode only: a placeholder that moves no funds. Never broadcast it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<bool>,
+}
+
 /// The transaction for the user's wallet, discriminated by `vm`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "vm", rename_all = "lowercase")]
+#[allow(clippy::large_enum_variant)]
 pub enum BuiltTx {
     Evm(EvmTx),
     Svm(SvmTx),
+    /// Tron (`vm: "tvm"`).
+    Tvm(TronTx),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildOrderResponse {
-    pub tx: BuiltTx,
+    #[serde(default)]
+    pub tx: Option<BuiltTx>,
+    #[serde(default)]
+    pub gasless: Option<GaslessSignRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,6 +670,7 @@ pub struct SimulateResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderId>,
     pub ok: bool,
+    /// `evm` · `svm` · `tvm`.
     pub vm: String,
     /// EVM gas estimate (integer string; numbers are accepted too).
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "string_or_number")]
@@ -251,6 +678,9 @@ pub struct SimulateResponse {
     /// Solana compute units consumed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute_units: Option<u64>,
+    /// Tron energy the simulated call used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_used: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs_approval: Option<bool>,
     /// `tx` (the swap itself) or `approval` (only the approval could be simulated).
@@ -262,7 +692,8 @@ pub struct SimulateResponse {
     pub tx: Option<BuiltTx>,
 }
 
-/// `pending` · `filled` · `refunded` · `failed` · `unknown`.
+/// `pending` · `filled` · `refunded` · `failed` · `unknown` · `dropped` (the source tx never
+/// reached the network, no funds moved; final, re-quote).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderStatus {
@@ -1491,4 +1922,601 @@ where
         Some(serde_json::Value::Number(n)) => Some(n.to_string()),
         Some(other) => Some(other.to_string()),
     })
+}
+
+/// One quotable leg, in the same terms as a quote request (chain ids, token addresses, base units).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteLeg {
+    pub src_chain: u64,
+    pub src_token: String,
+    /// Base units of `src_token`.
+    pub amount: String,
+    pub dst_chain: u64,
+    pub dst_token: String,
+    /// Estimated output, base units of `dst_token`. Quote the leg again before building it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_amount: Option<String>,
+}
+
+/// The hub token between the two steps of a `via_hub` [`RouteSuggestion`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteHub {
+    pub chain_id: u64,
+    pub token: String,
+    pub symbol: String,
+    pub decimals: u32,
+}
+
+/// An alternative to a route that returned no quote (D-053), from [`crate::Error::suggestions`].
+/// The leg fields describe the whole trip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteSuggestion {
+    /// `dst_token` (another destination token) · `src_token` (pay with another source token) ·
+    /// `via_hub` (two signed steps through a hub chain).
+    pub kind: String,
+    /// Short text for a button, e.g. "Receive USDC on Ethereum instead".
+    pub message: String,
+    pub src_chain: u64,
+    pub src_token: String,
+    pub amount: String,
+    pub dst_chain: u64,
+    pub dst_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_amount: Option<String>,
+    /// The token that changed (new source or destination token, or the hub token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// `via_hub` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<RouteHub>,
+    /// `via_hub` only: the two legs in order, each its own quote, order and signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<RouteLeg>>,
+}
+
+impl RouteSuggestion {
+    /// The whole trip as one leg.
+    pub fn leg(&self) -> RouteLeg {
+        RouteLeg {
+            src_chain: self.src_chain,
+            src_token: self.src_token.clone(),
+            amount: self.amount.clone(),
+            dst_chain: self.dst_chain,
+            dst_token: self.dst_token.clone(),
+            dst_amount: self.dst_amount.clone(),
+        }
+    }
+}
+
+/// At most this many route suggestions per error.
+pub const MAX_ROUTE_SUGGESTIONS: usize = 4;
+
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 78 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn parse_leg(v: &serde_json::Value) -> Option<RouteLeg> {
+    let o = v.as_object()?;
+    let amount = o.get("amount")?.as_str()?;
+    if !is_digits(amount) || amount.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    let dst_amount = match o.get("dstAmount") {
+        None => None,
+        Some(d) => Some(d.as_str().filter(|s| is_digits(s))?.to_string()),
+    };
+    Some(RouteLeg {
+        src_chain: o.get("srcChain")?.as_u64()?,
+        src_token: o.get("srcToken")?.as_str()?.to_string(),
+        amount: amount.to_string(),
+        dst_chain: o.get("dstChain")?.as_u64()?,
+        dst_token: o.get("dstToken")?.as_str()?.to_string(),
+        dst_amount,
+    })
+}
+
+fn parse_suggestion(v: &serde_json::Value) -> Option<RouteSuggestion> {
+    let leg = parse_leg(v)?;
+    let kind = v.get("kind")?.as_str()?;
+    if !matches!(kind, "dst_token" | "src_token" | "via_hub") {
+        return None;
+    }
+    let message = v.get("message")?.as_str()?.to_string();
+    let (hub, steps) = if kind == "via_hub" {
+        let steps: Vec<RouteLeg> = v.get("steps")?.as_array()?.iter().map(parse_leg).collect::<Option<_>>()?;
+        if steps.len() != 2 {
+            return None;
+        }
+        let h = v.get("hub")?;
+        let hub = RouteHub {
+            chain_id: h.get("chainId")?.as_u64()?,
+            token: h.get("token")?.as_str()?.to_string(),
+            symbol: h.get("symbol")?.as_str()?.to_string(),
+            decimals: u32::try_from(h.get("decimals")?.as_u64()?).ok()?,
+        };
+        (Some(hub), Some(steps))
+    } else {
+        (None, None)
+    };
+    Some(RouteSuggestion {
+        kind: kind.to_string(),
+        message,
+        src_chain: leg.src_chain,
+        src_token: leg.src_token,
+        amount: leg.amount,
+        dst_chain: leg.dst_chain,
+        dst_token: leg.dst_token,
+        dst_amount: leg.dst_amount,
+        symbol: v.get("symbol").and_then(|s| s.as_str()).map(str::to_string),
+        hub,
+        steps,
+    })
+}
+
+/// `details.suggestions` of an API error, validated: malformed entries (and a `via_hub` entry
+/// without a valid `hub` and exactly two valid `steps`) are dropped; at most
+/// [`MAX_ROUTE_SUGGESTIONS`]. Anything that isn't an array gives an empty list.
+pub fn parse_route_suggestions(details: &serde_json::Value) -> Vec<RouteSuggestion> {
+    details
+        .get("suggestions")
+        .and_then(|s| s.as_array())
+        .map(|a| a.iter().filter_map(parse_suggestion).take(MAX_ROUTE_SUGGESTIONS).collect())
+        .unwrap_or_default()
+}
+
+/// `error.details` of `AMOUNT_TOO_SMALL` on a quote (D-036), from [`crate::Error::amount_too_small`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AmountTooSmallDetails {
+    /// Smallest input known to quote on this route, base units of `src_token`.
+    pub min_amount: Option<String>,
+    pub min_amount_usd: Option<f64>,
+    /// `true` when found by probing $10 / $25 / $50 (the true minimum is at most this).
+    pub min_amount_approx: Option<bool>,
+}
+
+/// One share of a [`CreateSplitParams`]: a label, and an amount for custom shares (all or none).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SplitShareInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Base units; the amounts must add up to `total`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+}
+
+/// Parameters for [`crate::Splits::create`] (`POST /v1/splits`). Send `participants` or `shares`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSplitParams {
+    /// Address, ENS name or `.sol` name of whoever is owed.
+    pub recipient: String,
+    /// Chain slug or id they receive on.
+    pub chain: String,
+    /// Listed token symbol or address on that chain.
+    pub token: String,
+    /// Base units of `token`.
+    pub total: String,
+    /// Equal shares for this many people (2–50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participants: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares: Option<Vec<SplitShareInput>>,
+    /// Plain text, kept to 140 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Parameters for [`crate::Splits::update`]. Only `Some` fields are sent; `note: Some(None)` sends
+/// `null` to clear the note.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSplitParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<Option<String>>,
+    /// One label per share.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    /// `open` or `closed` (no more payments).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// The token of a [`Split`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SplitToken {
+    pub address: String,
+    pub symbol: String,
+    pub decimals: u32,
+}
+
+/// One share of a [`Split`] and who has paid it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SplitShare {
+    /// `split_share` on quotes.
+    pub index: u32,
+    pub label: String,
+    /// Base units.
+    pub amount: String,
+    /// Base units delivered by filled orders for this share.
+    pub received: String,
+    /// `unpaid` · `partial` · `paid`.
+    pub status: String,
+    pub payments: u32,
+    pub pending: u32,
+}
+
+/// A split bill: `recipient` is owed `total` of `token`, in shares paid by quotes with
+/// [`QuoteParams::split_id`] / [`QuoteParams::split_share`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Split {
+    pub id: String,
+    /// The split's page.
+    pub url: String,
+    /// `open` · `closed`.
+    pub status: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub recipient: String,
+    #[serde(default)]
+    pub recipient_name: Option<String>,
+    pub chain_id: u64,
+    pub chain: String,
+    pub token: SplitToken,
+    pub total: String,
+    pub collected: String,
+    #[serde(default)]
+    pub paid_count: u32,
+    #[serde(default)]
+    pub shares: Vec<SplitShare>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Response of [`crate::Splits::create`]: the split plus its one-time edit secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitCreated {
+    #[serde(flatten)]
+    pub split: Split,
+    /// The edit secret, shown only once. Keep it to [`crate::Splits::update`] the split.
+    pub edit_token: String,
+    /// The split's page with the secret in the URL fragment.
+    pub edit_url: String,
+}
+
+/// A tipper's message in a [`TipJar`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TipJarMessage {
+    pub text: String,
+    pub at: String,
+}
+
+/// Tip jar counters of an address, from [`crate::LayerHop::get_tip_jar`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TipJar {
+    /// EVM lowercased.
+    pub address: String,
+    /// Distinct wallets with a filled tip.
+    pub tippers: u64,
+    /// Filled tips.
+    pub tips: u64,
+    /// The latest 10 messages.
+    pub messages: Vec<TipJarMessage>,
+}
+
+/// One payout row for [`PayoutPlanParams::rows`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PayoutRow {
+    /// Address, ENS name or `.sol` name.
+    pub recipient: String,
+    /// Human units of `token` (`"25"`, `"0.5"`), not base units.
+    pub amount: String,
+    /// Symbol or address.
+    pub token: String,
+    /// Chain slug or id.
+    pub chain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Parameters for [`crate::Payouts::plan`] (`POST /v1/payouts/plan`). Send `rows` or `csv`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutPlanParams {
+    /// The chain the payer pays from.
+    pub src_chain: String,
+    /// The token the payer pays with (listed).
+    pub src_token: String,
+    /// The payer's address on `src_chain`.
+    pub sender: String,
+    /// At most 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<PayoutRow>>,
+    /// `recipient,amount,token,chain[,label]` lines, header optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csv: Option<String>,
+}
+
+/// A token in a payout plan.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutToken {
+    pub chain_id: u64,
+    pub address: String,
+    pub symbol: String,
+    pub decimals: u32,
+    /// USD price when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+}
+
+/// The payer's side of a [`PayoutPlan`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutPlanSource {
+    pub chain_id: u64,
+    pub chain: String,
+    pub sender: String,
+    pub token: PayoutToken,
+}
+
+/// Why a [`PayoutPlanRow`] is invalid.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PayoutRowError {
+    pub code: String,
+    pub message: String,
+}
+
+/// A resolved payout recipient.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PayoutRecipient {
+    pub address: String,
+    /// The ENS / `.sol` name it came from.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// One checked row of a [`PayoutPlan`]: `ok` with the resolved details, or an `error`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PayoutPlanRow {
+    /// Row number from 0 (header excluded).
+    pub index: u32,
+    /// 1-based CSV line (0 for JSON rows).
+    pub line: u32,
+    /// The row as sent (raw JSON).
+    pub input: serde_json::Value,
+    pub ok: bool,
+    pub error: Option<PayoutRowError>,
+    pub recipient: Option<PayoutRecipient>,
+    pub chain_id: Option<u64>,
+    pub chain: Option<String>,
+    pub token: Option<PayoutToken>,
+    /// Base units of `token`.
+    pub amount: Option<String>,
+    /// `transfer` (same chain and token as the payer) or `route` (quote it with `purpose: payout`).
+    pub kind: Option<String>,
+}
+
+/// A batch of plain transfers in a [`PayoutPlan`]; build it with [`crate::Payouts::transfers`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutTransferBatch {
+    pub chain_id: u64,
+    pub token: String,
+    /// Row indices.
+    pub rows: Vec<u32>,
+    /// Base units of the payer's token.
+    pub total: String,
+}
+
+/// Routed rows of a [`PayoutPlan`] for one destination chain (one quote and signature per row).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutRouteGroup {
+    pub chain_id: u64,
+    pub rows: Vec<u32>,
+}
+
+/// What one destination token adds up to in a [`PayoutPlan`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutTotal {
+    pub chain_id: u64,
+    pub token: String,
+    pub symbol: String,
+    pub decimals: u32,
+    pub amount: String,
+    pub formatted: String,
+    pub rows: u32,
+}
+
+/// Response of [`crate::Payouts::plan`]: every row checked, and the valid ones grouped.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PayoutPlan {
+    pub source: PayoutPlanSource,
+    pub rows: Vec<PayoutPlanRow>,
+    pub transfers: Vec<PayoutTransferBatch>,
+    pub routes: Vec<PayoutRouteGroup>,
+    /// Base units of the payer's token sent as transfers.
+    pub transfer_total: String,
+    pub totals: Vec<PayoutTotal>,
+    pub valid: u32,
+    pub invalid: u32,
+    pub warnings: Vec<String>,
+}
+
+/// One transfer for [`PayoutTransfersParams`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PayoutTransfer {
+    /// An address (resolve names with the plan first).
+    pub recipient: String,
+    /// Base units.
+    pub amount: String,
+}
+
+/// Parameters for [`crate::Payouts::transfers`] (`POST /v1/payouts/transfers`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PayoutTransfersParams {
+    pub chain: String,
+    pub token: String,
+    pub sender: String,
+    /// At most 20 on EVM chains and 8 on Solana.
+    pub transfers: Vec<PayoutTransfer>,
+}
+
+/// Unsigned transfers from [`crate::Payouts::transfers`]: EVM `calls` (one per transfer, send them
+/// in order) or a Solana `serialized_tx` (base64, the sender's signature slot). The SDK never signs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutTransfers {
+    /// `evm` or `svm`.
+    pub vm: String,
+    pub chain_id: u64,
+    pub token: PayoutToken,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<Vec<EvmCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serialized_tx: Option<String>,
+}
+
+/// Parameters for [`crate::RecurringOrders::create`] (`POST /v1/recurring-orders`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRecurringOrderParams {
+    /// The Solana wallet that funds, signs and owns the order.
+    pub wallet: String,
+    /// Token bought: mint or symbol.
+    pub dst_token: String,
+    /// The whole budget, base units of `src_token`, deposited when the order opens.
+    pub amount: String,
+    /// Number of buys (2–1000); each spends `amount / orders` (at least $50).
+    pub orders: u32,
+    /// Seconds between buys (86400 = daily).
+    pub interval_seconds: u64,
+    /// Token spent: mint or symbol. Default `USDC`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_token: Option<String>,
+    /// Only `solana` (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+}
+
+/// Fees of a recurring order: always 0.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RecurringOrderFees {
+    pub our_fee_bps: u32,
+    pub integrator_fee_bps: u32,
+}
+
+/// Response of [`crate::RecurringOrders::create`]: sign `tx` with `wallet` (sign only) and
+/// [`crate::RecurringOrders::submit`] it with `request_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurringOrderBuild {
+    pub object: String,
+    pub livemode: bool,
+    /// `jupiter` or `sandbox`.
+    pub provider: ProviderId,
+    pub chain_id: u64,
+    pub wallet: String,
+    /// Mint spent.
+    pub src_token: String,
+    /// Mint bought.
+    pub dst_token: String,
+    pub amount: String,
+    pub amount_per_order: String,
+    pub orders: u32,
+    pub interval_seconds: u64,
+    #[serde(default)]
+    pub fees: RecurringOrderFees,
+    pub request_id: String,
+    pub tx: SvmTx,
+}
+
+/// One buy of a [`RecurringOrder`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RecurringOrderFill {
+    pub tx_hash: String,
+    pub amount: String,
+    pub dst_amount: String,
+    /// Jupiter's fee, base units of `fee_token`.
+    pub fee_amount: String,
+    pub fee_token: Option<String>,
+    pub filled_at: Option<String>,
+}
+
+/// A Solana recurring order (Jupiter Recurring), read live from Jupiter. Base units throughout.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RecurringOrder {
+    /// The order account.
+    pub id: String,
+    pub object: String,
+    pub provider: ProviderId,
+    pub chain_id: u64,
+    /// `active` · `completed` · `cancelled`.
+    pub status: String,
+    pub wallet: String,
+    pub src_token: String,
+    pub dst_token: String,
+    pub amount: String,
+    pub amount_per_order: String,
+    pub orders: u32,
+    pub orders_filled: u32,
+    pub interval_seconds: u64,
+    pub spent_amount: String,
+    pub withdrawn_amount: String,
+    pub received_amount: String,
+    pub open_tx_hash: Option<String>,
+    pub close_tx_hash: Option<String>,
+    pub created_at: Option<String>,
+    /// Up to 50 most recent buys.
+    pub fills: Vec<RecurringOrderFill>,
+}
+
+/// Parameters for [`crate::RecurringOrders::list`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListRecurringOrdersParams {
+    pub wallet: String,
+    /// `active` (default) or `history`.
+    pub status: Option<String>,
+    /// From 1.
+    pub page: Option<u32>,
+}
+
+/// Response of [`crate::RecurringOrders::list`] (10 per page).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ListRecurringOrdersResponse {
+    pub recurring_orders: Vec<RecurringOrder>,
+    pub page: u32,
+    pub total_pages: u32,
+}
+
+/// Response of [`crate::RecurringOrders::submit`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitRecurringOrderResponse {
+    pub tx_hash: String,
+    /// The order account (create); `None` for a cancel.
+    #[serde(default)]
+    pub order: Option<String>,
+}
+
+/// Response of [`crate::RecurringOrders::cancel`]: sign `tx` and submit it with `request_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelRecurringOrderResponse {
+    pub request_id: String,
+    pub tx: SvmTx,
 }

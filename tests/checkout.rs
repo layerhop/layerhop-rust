@@ -274,8 +274,7 @@ async fn test_mode_fields() {
             dst_token: "SOL".into(),
             sender: "a".into(),
             recipient: "b".into(),
-            slippage_bps: None,
-            gas_on_arrival: None,
+            ..Default::default()
         })
         .await
         .unwrap();
