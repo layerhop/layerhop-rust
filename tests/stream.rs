@@ -152,7 +152,7 @@ async fn stream_404_yields_one_api_error() {
     let items: Vec<_> = lh.stream_order("q_x").collect().await;
     assert_eq!(items.len(), 1);
     match &items[0] {
-        Err(Error::Api { code, status, request_id, message }) => {
+        Err(Error::Api { code, status, request_id, message, .. }) => {
             assert_eq!((code.as_str(), *status, request_id.as_deref()), ("ORDER_NOT_FOUND", 404, Some("r1")));
             assert_eq!(message, "No order");
         }

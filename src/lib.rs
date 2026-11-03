@@ -21,8 +21,7 @@
 //!         dst_token: "SOL".into(),
 //!         sender: "0x...".into(),
 //!         recipient: "9WzD...".into(),
-//!         slippage_bps: None,
-//!         gas_on_arrival: None,
+//!         ..Default::default()
 //!     })
 //!     .await?;
 //! let tx = lh.build_tx(&q.best.quote_id).await?;
@@ -38,7 +37,7 @@ pub mod webhook;
 
 pub use client::{
     Checkout, CheckoutProducts, CheckoutRefunds, DepositAddresses, Invoices, LayerHop, LayerHopBuilder, LimitOrders,
-    Subscriptions, WatchOptions, Webhooks, DEFAULT_BASE_URL,
+    Payouts, RecurringOrders, Splits, Subscriptions, WatchOptions, Webhooks, DEFAULT_BASE_URL,
 };
 pub use error::{Error, Result};
 pub use models::{
@@ -58,10 +57,24 @@ pub use models::{
     TriggerWebhookResponse, UpdateCheckoutProductParams, UpdateInvoiceParams, UpdateSubscriptionParams,
     WebhookEvent, WebhookEventData,
 };
-
+pub use models::{
+    parse_route_suggestions, AmountTooSmallDetails, Balance, BalanceError, BalancesParams, BalancesResponse,
+    CallsQuoteParams, CallsSimulation, CancelRecurringOrderResponse, ChainRouteHealth, CreateRecurringOrderParams,
+    CreateSplitParams, DestinationAction, DestinationCall, DestinationCallsPlan, Eip712TypedData, GasFee,
+    GaslessOrderStatus, GaslessQuoteInfo, GaslessSignRequest, GaslessSignable, ListRecurringOrdersParams,
+    ListRecurringOrdersResponse, OnlyRoute, PayoutPlan, PayoutPlanParams, PayoutPlanRow, PayoutPlanSource,
+    PayoutRecipient, PayoutRouteGroup, PayoutRow, PayoutRowError, PayoutToken, PayoutTotal, PayoutTransfer,
+    PayoutTransferBatch, PayoutTransfers, PayoutTransfersParams, RecurringOrder, RecurringOrderBuild,
+    RecurringOrderFees, RecurringOrderFill, RouteHub, RouteLeg, RouteSuggestion, Split, SplitCreated,
+    SplitShare, SplitShareInput, SplitToken, SubmitRecurringOrderResponse, TipJar, TipJarMessage, TokenRisk,
+    TokenRiskReason, TokenSearchParams, TokensPage, TronApproval, TronCall, TronTx, TronUnsignedTx,
+    UpdateSplitParams, MAX_ROUTE_SUGGESTIONS,
+};
 
 /// LayerHop's internal chain id for Solana (EVM chains use their real chain id).
 pub const SOLANA_CHAIN_ID: u64 = 7565164;
+/// Tron mainnet chain id (`vm: "tvm"`, D-048).
+pub const TRON_CHAIN_ID: u64 = 728126428;
 /// Native coin address on EVM chains.
 pub const EVM_NATIVE: &str = "0x0000000000000000000000000000000000000000";
 /// Wrapped-SOL mint, used for native SOL.

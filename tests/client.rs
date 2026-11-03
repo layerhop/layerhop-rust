@@ -27,8 +27,7 @@ fn params() -> QuoteParams {
         dst_token: "SOL".into(),
         sender: "0x1111111111111111111111111111111111111111".into(),
         recipient: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".into(),
-        slippage_bps: None,
-        gas_on_arrival: None,
+        ..Default::default()
     }
 }
 
@@ -313,7 +312,7 @@ async fn api_errors_carry_code_and_request_id() {
 
     let lh = client(&server);
     match lh.build_tx("q_old").await.unwrap_err() {
-        Error::Api { code, status, request_id, message } => {
+        Error::Api { code, status, request_id, message, .. } => {
             assert_eq!(code, "QUOTE_EXPIRED");
             assert_eq!(status, 410);
             assert_eq!(request_id.as_deref(), Some("req-1"));
@@ -364,6 +363,23 @@ async fn watch_yields_changes_until_final() {
         .collect()
         .await;
     assert_eq!(states, vec!["pending".to_string(), "filled".to_string()]);
+}
+
+#[tokio::test]
+async fn watch_ends_on_dropped() {
+    let server = MockServer::start().await;
+    for (state, times) in [("pending", 1u64), ("dropped", 1), ("pending", 10)] {
+        Mock::given(method("GET"))
+            .and(path("/v1/orders/relay/0xabc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(status_body(state)))
+            .up_to_n_times(times)
+            .mount(&server)
+            .await;
+    }
+    let opts = WatchOptions { interval: Duration::from_millis(5), timeout: Duration::from_secs(5) };
+    let items: Vec<_> = client(&server).watch("relay", "0xabc", opts).collect().await;
+    let states: Vec<String> = items.into_iter().map(|r| r.unwrap().state).collect();
+    assert_eq!(states, vec!["pending".to_string(), "dropped".to_string()]);
 }
 
 #[tokio::test]
