@@ -322,6 +322,47 @@ pub struct CallsQuoteParams {
     pub copy_of: Option<String>,
 }
 
+/// Parameters for [`crate::LayerHop::quote_exact_output`]: receive exactly `dst_amount`. Each
+/// quote reports `src_amount` (what `sender` pays) and `src_amount_max` (the most the transaction
+/// can take, for balance and approval checks). Only providers that quote a fixed output answer;
+/// not with gas on arrival or gasless.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExactOutputQuoteParams {
+    pub src_chain: String,
+    pub src_token: String,
+    pub dst_chain: String,
+    pub dst_token: String,
+    /// The exact base units of `dst_token` the recipient receives.
+    pub dst_amount: String,
+    pub sender: String,
+    pub recipient: String,
+    /// Defaults to 50.
+    pub slippage_bps: Option<u32>,
+    pub referrer: Option<String>,
+    pub copy_of: Option<String>,
+    /// As [`QuoteParams::purpose`].
+    pub purpose: Option<String>,
+    pub split_id: Option<String>,
+    pub split_share: Option<u32>,
+    pub note: Option<String>,
+}
+
+/// Options for [`crate::LayerHop::quote_stream`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuoteStreamOptions {
+    /// Refresh interval in ms (server default 10000, minimum 5000). Each refresh counts as one
+    /// request against your rate limit.
+    pub interval_ms: Option<u32>,
+}
+
+/// One `quote` event of a live quote stream: a full [`QuoteResponse`] plus its sequence number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuoteStreamUpdate {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub response: QuoteResponse,
+}
+
 /// The destination calls of a quote, as the provider committed to them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -474,9 +515,14 @@ pub struct Quote {
     /// Native gas delivered to the recipient on top of `dst_amount` (when requested and included).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gas_on_arrival: Option<GasOnArrival>,
-    /// What `sender` pays, fees included (destination-call quotes, by exact output).
+    /// What `sender` pays, fees included (exact-output quotes: [`crate::LayerHop::quote_exact_output`]
+    /// and destination calls).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub src_amount: Option<String>,
+    /// Exact-output quotes: the most the transaction can take from `sender`, slippage included
+    /// (>= `src_amount`). Check balances and approvals against this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_amount_max: Option<String>,
     /// The destination calls and their simulation ([`crate::LayerHop::quote_calls`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calls: Option<DestinationCallsPlan>,
@@ -500,9 +546,25 @@ pub struct QuoteResponse {
     pub quotes: Vec<Quote>,
     #[serde(default)]
     pub errors: Vec<ProviderError>,
+    /// Present only when the request was served, but not exactly as asked (e.g.
+    /// `GAS_ON_ARRIVAL_UNAVAILABLE`). Ignore codes you don't know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<QuoteWarning>>,
     /// `Some(false)` when the request used an `lh_test_` key (sandbox quotes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub livemode: Option<bool>,
+    /// Address screening (D-069): which of this request's addresses are on the OFAC SDN list.
+    /// Present once the API has a list loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screening: Option<ScreeningAnnotation>,
+}
+
+/// A note on a quote response that was served, but not exactly as asked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteWarning {
+    pub code: String,
+    pub message: String,
 }
 
 /// ERC-20 `approve(spender, amount)` on `token` to be mined before the main transaction.
@@ -801,6 +863,10 @@ pub struct CreateCheckoutParams {
     /// 5–10080, default 60.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_in_minutes: Option<u32>,
+    /// Embedded checkout: the only sites (exact origins) that may show the session in an iframe.
+    /// Empty = any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_origins: Option<Vec<String>>,
 }
 
 /// The token a checkout session is paid out in.
@@ -817,7 +883,13 @@ pub struct CheckoutSettlement {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutPayment {
-    pub quote_id: String,
+    /// `wallet`: paid through a quote on the page; `transfer`: a scan-to-pay transfer (D-064), no
+    /// quote.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// `None` for a scan-to-pay transfer.
+    #[serde(default)]
+    pub quote_id: Option<String>,
     #[serde(default)]
     pub payer: Option<String>,
     #[serde(default)]
@@ -880,8 +952,124 @@ pub struct CheckoutSession {
     /// Only with the owning account's API key.
     #[serde(default)]
     pub metadata: Option<BTreeMap<String, String>>,
+    /// Only when paid plans are enabled: `false` when the merchant's plan is white-label.
+    #[serde(default)]
+    pub branding: Option<bool>,
+    /// The payer can be shown a "Send to address" QR ([`crate::Checkout::start_transfer`]).
+    #[serde(default)]
+    pub transfer_available: Option<bool>,
+    /// Scan-to-pay state once the payer asked for a QR, else `None`.
+    #[serde(default)]
+    pub transfer: Option<CheckoutTransfer>,
+    /// Sites allowed to embed this checkout (empty = any).
+    #[serde(default)]
+    pub embed_origins: Option<Vec<String>>,
+    /// "Pay with Bitcoin" (D-067; only where the API enabled it): can this session show a BTC
+    /// deposit address.
+    #[serde(default)]
+    pub bitcoin_available: Option<bool>,
+    /// The Bitcoin payment once the payer asked for it ([`crate::Checkout::start_bitcoin`]).
+    #[serde(default)]
+    pub bitcoin: Option<CheckoutBitcoin>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Scan-to-pay ("Send to address", D-064). `evm_transfer`: send exactly `amount` of `token` to
+/// `address` on `chain_id` (the amount carries a tag in its sub-cent digits). `solana_pay`: scan
+/// `uri` (a Solana Pay transaction request) with a Solana wallet. `evm_splitter` (D-065): send
+/// exactly `amount` to `address`, the session's own fee-splitting deposit address.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutTransfer {
+    /// `evm_transfer` · `solana_pay` · `evm_splitter`.
+    pub kind: String,
+    pub chain_id: u64,
+    pub token: String,
+    pub symbol: String,
+    pub decimals: u32,
+    pub address: String,
+    /// What to send now, base units (EVM: the exact tagged amount; after a short payment, the rest).
+    pub amount: String,
+    pub amount_due: String,
+    /// LayerHop's fee on top, inside the same Solana Pay transaction.
+    #[serde(default)]
+    pub fee: Option<CheckoutTransferFee>,
+    /// QR payload: EIP-681 (EVM) or `solana:https://…/solana-pay` (Solana Pay transaction request).
+    pub uri: String,
+    /// Solana Pay transfer request (plain transfer), only when enabled.
+    #[serde(default)]
+    pub transfer_uri: Option<String>,
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// Confirmed so far, base units.
+    pub received: String,
+    /// Seen but still confirming, base units.
+    pub seen: String,
+    /// `waiting` · `partial` · `paid` · `overpaid`.
+    pub state: String,
+    #[serde(default)]
+    pub txs: Vec<CheckoutTransferTx>,
+    pub started_at: String,
+    /// `evm_splitter` only: the sweep that paid the deposit out to the merchant.
+    #[serde(default)]
+    pub sweep_tx_hash: Option<String>,
+}
+
+/// LayerHop's fee on a [`CheckoutTransfer`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckoutTransferFee {
+    pub bps: u32,
+    pub amount: String,
+}
+
+/// One transaction that paid a [`CheckoutTransfer`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckoutTransferTx {
+    pub hash: String,
+    pub amount: String,
+    #[serde(default)]
+    pub at: Option<String>,
+}
+
+/// "Pay with Bitcoin" (D-067): send exactly `amount_sats` (`amount_btc`) to `address`, a deposit
+/// address bound to this payment; the merchant receives `amount_out` of the settlement token. `uri`
+/// is the BIP21 payment request for the QR. After `expires_at` call
+/// [`crate::Checkout::start_bitcoin`] again for a fresh quote.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutBitcoin {
+    pub address: String,
+    pub amount_sats: String,
+    pub amount_btc: String,
+    pub uri: String,
+    pub amount_out: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub expired: bool,
+    /// `waiting` · `depositing` · `pending` · `submitted` · `success` · `failure` · `refund`.
+    pub status: String,
+    /// Satoshis seen at `address` (mempool included).
+    #[serde(default)]
+    pub seen_sats: String,
+    pub request_id: String,
+    pub fee_bps: u32,
+    #[serde(default)]
+    pub refund_address: Option<String>,
+    /// Every deposit quote of this payment.
+    #[serde(default)]
+    pub quotes: Vec<CheckoutBitcoinQuote>,
+}
+
+/// One Bitcoin deposit quote of a [`CheckoutBitcoin`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutBitcoinQuote {
+    pub address: String,
+    pub amount_sats: String,
+    pub status: String,
+    pub request_id: String,
+    pub created_at: String,
 }
 
 impl CheckoutSession {
@@ -1087,6 +1275,9 @@ pub struct CheckoutQuoteResponse {
     pub quotes: Vec<CheckoutQuote>,
     #[serde(default)]
     pub errors: Vec<ProviderError>,
+    /// Address screening (D-069) of the payer and payout addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screening: Option<ScreeningAnnotation>,
 }
 
 /// The JSON body LayerHop POSTs to your webhook endpoints, and what
@@ -1101,7 +1292,7 @@ pub struct WebhookEvent {
     /// `checkout.session.refunded` · `invoice.sent` · `invoice.paid` · `subscription.created` ·
     /// `subscription.renewed` · `subscription.past_due` · `subscription.canceled` ·
     /// `limit_order.opened` · `limit_order.filled` · `limit_order.cancelled` ·
-    /// `limit_order.expired` · `limit_order.failed` (or `webhook.test`).
+    /// `limit_order.expired` · `limit_order.failed` · `x402.payment.settled` (or `webhook.test`).
     #[serde(rename = "type")]
     pub event_type: String,
     pub livemode: bool,
@@ -1135,6 +1326,9 @@ pub struct WebhookEventData {
     pub limit_order: Option<LimitOrder>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<Order>,
+    /// `x402.payment.settled`: the settled x402 payment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment: Option<X402Payment>,
 }
 
 /// Response of [`crate::Webhooks::trigger`] (`POST /v1/webhooks/trigger`).
@@ -2519,4 +2713,416 @@ pub struct SubmitRecurringOrderResponse {
 pub struct CancelRecurringOrderResponse {
     pub request_id: String,
     pub tx: SvmTx,
+}
+
+/// Address screening (D-069) on quotes, orders and checkout quotes: which addresses of the
+/// request are on the OFAC SDN list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreeningAnnotation {
+    /// `ofac_sdn`.
+    pub source: String,
+    /// Publish date of the list checked.
+    #[serde(default)]
+    pub list_updated_at: Option<String>,
+    /// Empty when no address is listed.
+    #[serde(default)]
+    pub sanctioned: Vec<SanctionedAddress>,
+}
+
+/// One listed address in a [`ScreeningAnnotation`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SanctionedAddress {
+    pub address: String,
+    /// `sender` · `recipient` · `refundTo` · `payer` · `payout`.
+    pub role: String,
+    #[serde(default)]
+    pub lists: Vec<String>,
+}
+
+/// One address's result from [`crate::LayerHop::screen`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreeningResult {
+    pub address: String,
+    pub sanctioned: bool,
+    /// Lists the address is on (`"OFAC SDN"`), empty when not listed.
+    #[serde(default)]
+    pub lists: Vec<String>,
+    /// `ofac_sdn`.
+    pub source: String,
+    /// Publish date of the list checked; `None` while the API has no list loaded.
+    #[serde(default)]
+    pub list_updated_at: Option<String>,
+}
+
+/// The sanctions list version loaded by the API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreeningList {
+    pub source: String,
+    pub name: String,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    pub fetched_at: String,
+    pub address_count: u64,
+}
+
+/// Response of [`crate::LayerHop::screen`] (`POST /v1/screen`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenResponse {
+    /// One result per address, in order.
+    pub results: Vec<ScreeningResult>,
+    /// `None` until the API has downloaded the list (every result is then `sanctioned: false`).
+    #[serde(default)]
+    pub list: Option<ScreeningList>,
+    /// The API refuses listed addresses for everyone (`ADDRESS_SANCTIONED`, HTTP 451).
+    pub enforced: bool,
+}
+
+/// Result of [`crate::Webhooks::resend`]: the deliveries queued (empty when only open streams get it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookResendResult {
+    pub event_id: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub livemode: bool,
+    #[serde(default)]
+    pub deliveries: Vec<WebhookResendDelivery>,
+}
+
+/// One delivery queued by [`crate::Webhooks::resend`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookResendDelivery {
+    pub id: String,
+    pub endpoint_id: String,
+}
+
+/// Parameters for [`crate::Usage::get`]. Times are ISO 8601 or unix seconds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageParams {
+    /// `hour` or `day`.
+    pub bucket: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// Only this API key of the account.
+    pub key_id: Option<String>,
+}
+
+/// Requests per HTTP status class.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StatusClassCounts {
+    #[serde(rename = "2xx", default)]
+    pub s2xx: u64,
+    #[serde(rename = "3xx", default)]
+    pub s3xx: u64,
+    #[serde(rename = "4xx", default)]
+    pub s4xx: u64,
+    #[serde(rename = "5xx", default)]
+    pub s5xx: u64,
+}
+
+/// Totals of a [`UsageReport`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub errors: u64,
+    #[serde(default)]
+    pub by_status_class: StatusClassCounts,
+    #[serde(default)]
+    pub avg_ms: Option<f64>,
+    #[serde(default)]
+    pub p50_ms: Option<f64>,
+    #[serde(default)]
+    pub p95_ms: Option<f64>,
+}
+
+/// One bucket of [`UsageReport::series`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePoint {
+    pub ts: String,
+    pub requests: u64,
+    pub errors: u64,
+    #[serde(default)]
+    pub by_status_class: StatusClassCounts,
+    #[serde(default)]
+    pub p50_ms: Option<f64>,
+    #[serde(default)]
+    pub p95_ms: Option<f64>,
+}
+
+/// One endpoint group of [`UsageReport::by_endpoint`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageEndpoint {
+    pub group: String,
+    pub requests: u64,
+    pub errors: u64,
+    #[serde(default)]
+    pub by_status_class: StatusClassCounts,
+    #[serde(default)]
+    pub avg_ms: Option<f64>,
+    #[serde(default)]
+    pub p50_ms: Option<f64>,
+    #[serde(default)]
+    pub p95_ms: Option<f64>,
+}
+
+/// One error code of [`UsageReport::error_codes`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageErrorCode {
+    pub code: String,
+    pub count: u64,
+    /// Count per endpoint group.
+    #[serde(default)]
+    pub by_endpoint: BTreeMap<String, u64>,
+}
+
+/// `GET /v1/usage`: the key's account and mode. Latency percentiles are estimates (`None` without
+/// traffic).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageReport {
+    /// `hour` or `day`.
+    pub bucket: String,
+    pub from: String,
+    pub to: String,
+    pub livemode: bool,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    pub totals: UsageTotals,
+    #[serde(default)]
+    pub series: Vec<UsagePoint>,
+    #[serde(default)]
+    pub by_endpoint: Vec<UsageEndpoint>,
+    #[serde(default)]
+    pub error_codes: Vec<UsageErrorCode>,
+}
+
+/// Parameters for [`crate::Usage::errors`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageErrorsParams {
+    /// Only this error code (e.g. `RATE_LIMITED`).
+    pub code: Option<String>,
+    pub key_id: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// One failed request from [`crate::Usage::errors`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageError {
+    pub ts: String,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub endpoint_group: String,
+    pub status: u16,
+    pub code: String,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct UsageErrorsResponse {
+    #[serde(default)]
+    pub errors: Vec<UsageError>,
+}
+
+/// One scheme / network pair of [`X402Supported`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402Kind {
+    /// 1 or 2.
+    pub x402_version: u32,
+    /// `exact`.
+    pub scheme: String,
+    /// x402 v2 CAIP-2 id (`eip155:8453`) or v1 name (`base`).
+    pub network: String,
+}
+
+/// Response of [`crate::X402::supported`] (`GET /v1/x402/supported`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402Supported {
+    pub kinds: Vec<X402Kind>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub signers: BTreeMap<String, Vec<String>>,
+    /// Whether `POST /v1/x402/settle` is enabled.
+    pub settle: bool,
+}
+
+/// Parameters for [`crate::X402::requirements`] (`POST /v1/x402/requirements`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402RequirementsParams {
+    /// `base` (server default), `optimism`, `arbitrum`, `polygon`, or a CAIP-2 id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// The price you net per request, USDC base units (`"10000"` = 0.01 USDC).
+    pub amount: String,
+    /// Your payout address on that network.
+    pub pay_to: String,
+    /// The resource URL (query ignored for the deposit address) or any stable id.
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// 10–3600, default 60.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_timeout_seconds: Option<u32>,
+}
+
+/// Your fee-splitting deposit address for one resource and payout address.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402Payee {
+    pub id: String,
+    pub network: String,
+    pub chain_id: u64,
+    pub asset: String,
+    /// The requirements' `payTo`: it can only pay you and the fee.
+    pub deposit_address: String,
+    pub merchant: String,
+    pub resource: String,
+    pub fee_bps: u32,
+    pub factory: String,
+    #[serde(default)]
+    pub last_sweep_tx: Option<String>,
+    #[serde(default)]
+    pub last_swept_at: Option<String>,
+}
+
+/// LayerHop's fee on top of an x402 price.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct X402Fee {
+    pub bps: u32,
+    pub amount: String,
+}
+
+/// Response of [`crate::X402::requirements`]: answer `402 Payment Required` with these.
+/// `accepts` is the x402 v2 form, `accepts_v1` the v1 form, `payment_required` the whole v2
+/// `PaymentRequired` object (base64 it into the `PAYMENT-REQUIRED` header). Kept as raw JSON so
+/// they reach the payer unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402Requirements {
+    pub payee: X402Payee,
+    /// What you net, USDC base units.
+    pub price: String,
+    /// What the payer signs (price + fee).
+    pub amount: String,
+    pub fee: X402Fee,
+    pub accepts: Vec<serde_json::Value>,
+    #[serde(rename = "acceptsV1")]
+    pub accepts_v1: Vec<serde_json::Value>,
+    pub payment_required: serde_json::Value,
+}
+
+/// Body of [`crate::X402::verify`] and [`crate::X402::settle`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402FacilitatorRequest {
+    /// 1 or 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x402_version: Option<u32>,
+    /// The decoded `X-PAYMENT` (v1) or `PAYMENT-SIGNATURE` (v2) header.
+    pub payment_payload: serde_json::Value,
+    /// The requirements you answered the 402 with (v1 or v2 form).
+    pub payment_requirements: serde_json::Value,
+}
+
+/// Response of [`crate::X402::verify`]. `is_valid: false` carries an x402 `invalid_reason`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402VerifyResponse {
+    pub is_valid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Response of [`crate::X402::settle`]. `error_reason: settlement_pending` = sent, receipt not in
+/// yet (LayerHop finishes it and `x402.payment.settled` fires then).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402SettleResponse {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payer: Option<String>,
+    /// Transaction hash (empty when nothing was sent).
+    pub transaction: String,
+    pub network: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// An x402 payment settled through LayerHop (`object: "x402.payment"`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402Payment {
+    pub id: String,
+    pub object: String,
+    /// `submitted` · `settled` · `failed`.
+    pub status: String,
+    #[serde(default)]
+    pub status_detail: Option<String>,
+    pub network: String,
+    pub chain_id: u64,
+    pub asset: String,
+    pub payer: String,
+    /// The deposit address paid.
+    pub pay_to: String,
+    /// What the payer paid, USDC base units.
+    pub amount: String,
+    /// What you net after the deposit contract's fee.
+    pub merchant_amount: String,
+    pub fee_bps: u32,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub transaction: Option<String>,
+    /// The sweep that paid it out to you.
+    #[serde(default)]
+    pub sweep_tx: Option<String>,
+    #[serde(default)]
+    pub settled_at: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// Parameters for [`crate::X402Payments::list`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListX402PaymentsParams {
+    /// `submitted` · `settled` · `failed`.
+    pub status: Option<String>,
+    pub cursor: Option<String>,
+    /// 1–200, default 50.
+    pub limit: Option<u32>,
+}
+
+/// Response of [`crate::X402Payments::list`], newest first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListX402PaymentsResponse {
+    #[serde(default)]
+    pub payments: Vec<X402Payment>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
