@@ -104,7 +104,7 @@ struct ErrorEnvelope {
     error: Option<ErrorBody>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ErrorBody {
     code: Option<String>,
@@ -179,6 +179,15 @@ impl LayerHop {
         path: String,
         event: &'static str,
     ) -> impl Stream<Item = Result<T>> + Send + 'static {
+        decode_frames(self.sse_frames(path, vec![event]))
+    }
+
+    /// Open a Server-Sent Events stream and yield `(event, data)` of the frames named in `events`.
+    fn sse_frames(
+        &self,
+        path: String,
+        events: Vec<&'static str>,
+    ) -> impl Stream<Item = Result<(String, String)>> + Send + 'static {
         let client = self.clone();
         let open = async move {
             let mut req = client
@@ -195,7 +204,7 @@ impl LayerHop {
             Ok(res)
         };
         stream::once(open).flat_map(move |res| match res {
-            Ok(res) => Either::Left(parse_sse::<T, _, _>(res.bytes_stream(), event)),
+            Ok(res) => Either::Left(parse_frames(res.bytes_stream(), events.clone())),
             Err(e) => Either::Right(stream::once(future::ready(Err(e)))),
         })
     }
@@ -282,7 +291,89 @@ impl LayerHop {
 
     /// `GET /v1/quote` — asks every provider; `best` is the highest output for the user.
     pub async fn quote(&self, p: &QuoteParams) -> Result<QuoteResponse> {
-        let mut q: Vec<(&str, String)> = vec![
+        self.call(Method::GET, "/quote", &self.quote_query(p), None).await
+    }
+
+    /// `GET /v1/quote` with `dstAmount` — receive an exact amount. Each quote reports `src_amount`
+    /// (what `sender` pays) and `src_amount_max` (the most the transaction can take, for balance
+    /// and approval checks); `best` is the lowest input. Only providers that quote a fixed output
+    /// answer.
+    pub async fn quote_exact_output(&self, p: &ExactOutputQuoteParams) -> Result<QuoteResponse> {
+        self.call(Method::GET, "/quote", &self.exact_output_query(p), None).await
+    }
+
+    /// `GET /v1/quote/stream` — live quotes (Server-Sent Events, D-068): yields a fresh ranked
+    /// quote set first, then whenever the best route or any amount changes (and before the shown
+    /// quote expires). Ends after the stream's lifetime (5 minutes). A refresh that fails (e.g.
+    /// `NO_ROUTE`, `RATE_LIMITED`, `ADDRESS_SANCTIONED`) yields one [`Error::Api`] and ends the
+    /// stream. Each refresh counts against your rate limit; at most 3 open streams per key. Drop the
+    /// stream to stop. Every `quote_id` builds with [`LayerHop::build_tx`] as usual.
+    pub fn quote_stream(
+        &self,
+        p: &QuoteParams,
+        opts: &QuoteStreamOptions,
+    ) -> impl Stream<Item = Result<QuoteStreamUpdate>> + Send + 'static {
+        self.open_quote_stream(self.quote_query(p), opts)
+    }
+
+    /// [`LayerHop::quote_stream`] for an exact output (`dstAmount`).
+    pub fn quote_stream_exact_output(
+        &self,
+        p: &ExactOutputQuoteParams,
+        opts: &QuoteStreamOptions,
+    ) -> impl Stream<Item = Result<QuoteStreamUpdate>> + Send + 'static {
+        self.open_quote_stream(self.exact_output_query(p), opts)
+    }
+
+    fn open_quote_stream(
+        &self,
+        mut q: Vec<(&'static str, String)>,
+        opts: &QuoteStreamOptions,
+    ) -> impl Stream<Item = Result<QuoteStreamUpdate>> + Send + 'static {
+        if let Some(ms) = opts.interval_ms {
+            q.push(("intervalMs", ms.to_string()));
+        }
+        let qs: Vec<String> =
+            q.iter().map(|(k, v)| format!("{}={}", k, urlencoding::encode(v))).collect();
+        quote_events(self.sse_frames(format!("/quote/stream?{}", qs.join("&")), vec!["quote", "error", "end"]))
+    }
+
+    /// `POST /v1/screen` — check up to 100 addresses against the OFAC SDN list (D-069). Public.
+    /// A list lookup only: no clustering or risk scoring.
+    pub async fn screen(&self, addresses: &[&str]) -> Result<ScreenResponse> {
+        self.call(Method::POST, "/screen", &[], Some(json!({ "addresses": addresses }))).await
+    }
+
+    /// `GET /v1/quote` / `GET /v1/quote/stream` query parameters for an exact output.
+    fn exact_output_query(&self, p: &ExactOutputQuoteParams) -> Vec<(&'static str, String)> {
+        let mut q = self.quote_query(&QuoteParams {
+            src_chain: p.src_chain.clone(),
+            src_token: p.src_token.clone(),
+            amount: p.dst_amount.clone(),
+            dst_chain: p.dst_chain.clone(),
+            dst_token: p.dst_token.clone(),
+            sender: p.sender.clone(),
+            recipient: p.recipient.clone(),
+            slippage_bps: p.slippage_bps,
+            referrer: p.referrer.clone(),
+            copy_of: p.copy_of.clone(),
+            purpose: p.purpose.clone(),
+            split_id: p.split_id.clone(),
+            split_share: p.split_share,
+            note: p.note.clone(),
+            ..Default::default()
+        });
+        for (k, _) in q.iter_mut() {
+            if *k == "amount" {
+                *k = "dstAmount";
+            }
+        }
+        q
+    }
+
+    /// `GET /v1/quote` / `GET /v1/quote/stream` query parameters.
+    fn quote_query(&self, p: &QuoteParams) -> Vec<(&'static str, String)> {
+        let mut q: Vec<(&'static str, String)> = vec![
             ("srcChain", p.src_chain.clone()),
             ("srcToken", p.src_token.clone()),
             ("amount", p.amount.clone()),
@@ -325,7 +416,7 @@ impl LayerHop {
         if let Some(v) = &p.note {
             q.push(("note", v.clone()));
         }
-        self.call(Method::GET, "/quote", &q, None).await
+        q
     }
 
     /// `POST /v1/quote` — a quote by exact output with destination calls (D-029): the provider's
@@ -476,9 +567,20 @@ impl LayerHop {
         self.sse(format!("/orders/{}/events", urlencoding::encode(quote_id)), "order")
     }
 
-    /// Webhook developer tools with an API key (the CLI's `listen` and `trigger`).
+    /// Webhook developer tools with an API key (the CLI's `listen`, `trigger` and `events resend`).
     pub fn webhooks(&self) -> Webhooks<'_> {
         Webhooks { client: self }
+    }
+
+    /// Usage and errors of the key's own account and mode (the dashboard's Usage page). API key.
+    pub fn usage(&self) -> Usage<'_> {
+        Usage { client: self }
+    }
+
+    /// x402 pay-per-request (D-066): LayerHop verifies and settles USDC payments per HTTP request
+    /// for you. Everything but `supported` needs an API key.
+    pub fn x402(&self) -> X402<'_> {
+        X402 { client: self }
     }
 
     /// Invoices: line items billed to a customer by email, paid through checkout. Everything needs
@@ -643,6 +745,25 @@ impl Checkout<'_> {
     pub async fn expire(&self, id: &str) -> Result<CheckoutSession> {
         let path = format!("/checkout/sessions/{}/expire", urlencoding::encode(id));
         self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `POST /v1/checkout/sessions/{id}/transfer` — public: show a "Send to address" QR for this
+    /// session (D-064, idempotent). Returns the session with its `transfer`.
+    pub async fn start_transfer(&self, id: &str) -> Result<CheckoutSession> {
+        let path = format!("/checkout/sessions/{}/transfer", urlencoding::encode(id));
+        self.client.call(Method::POST, &path, &[], Some(json!({}))).await
+    }
+
+    /// `POST /v1/checkout/sessions/{id}/bitcoin` — public: show (or refresh, once expired) a
+    /// Bitcoin deposit address for this session (D-067). `refund_address` is a Bitcoin address for
+    /// refunds. Returns the session with its `bitcoin`.
+    pub async fn start_bitcoin(&self, id: &str, refund_address: Option<&str>) -> Result<CheckoutSession> {
+        let path = format!("/checkout/sessions/{}/bitcoin", urlencoding::encode(id));
+        let body = match refund_address {
+            Some(a) => json!({ "refundAddress": a }),
+            None => json!({}),
+        };
+        self.client.call(Method::POST, &path, &[], Some(body)).await
     }
 
     /// `POST /v1/checkout/sessions/{id}/quote` — public: price paying the session with
@@ -1139,12 +1260,134 @@ impl Webhooks<'_> {
         self.client.sse("/webhooks/stream".to_string(), "event")
     }
 
+    /// [`Webhooks::stream`] that first replays the events created since `since` (ISO 8601 time, at
+    /// most an hour back): reconnect with the last event's `created_at` to miss nothing.
+    pub fn stream_since(&self, since: &str) -> impl Stream<Item = Result<WebhookEvent>> + Send + 'static {
+        self.client.sse(format!("/webhooks/stream?since={}", urlencoding::encode(since)), "event")
+    }
+
     /// `POST /v1/webhooks/trigger` — a sample event of `event_type` (e.g. `order.filled`) in test
     /// mode, sent to your test endpoints and open streams. Test keys only (`FORBIDDEN` otherwise).
     pub async fn trigger(&self, event_type: &str) -> Result<TriggerWebhookResponse> {
         self.client
             .call(Method::POST, "/webhooks/trigger", &[], Some(json!({ "type": event_type })))
             .await
+    }
+
+    /// `POST /v1/webhooks/events/{id}/resend` — send an event of the key's mode again: to every
+    /// subscribed endpoint (or only `endpoint_id`) and to open streams.
+    pub async fn resend(&self, event_id: &str, endpoint_id: Option<&str>) -> Result<WebhookResendResult> {
+        let path = format!("/webhooks/events/{}/resend", urlencoding::encode(event_id));
+        let body = match endpoint_id {
+            Some(id) => json!({ "endpointId": id }),
+            None => json!({}),
+        };
+        self.client.call(Method::POST, &path, &[], Some(body)).await
+    }
+}
+
+/// Usage and errors of the key's own account and mode, from [`LayerHop::usage`].
+#[derive(Debug, Clone, Copy)]
+pub struct Usage<'a> {
+    client: &'a LayerHop,
+}
+
+impl Usage<'_> {
+    /// `GET /v1/usage` — requests per hour or day with status classes, p50 / p95 latency, endpoint
+    /// groups and error codes.
+    pub async fn get(&self, p: &UsageParams) -> Result<UsageReport> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        for (k, v) in [("bucket", &p.bucket), ("from", &p.from), ("to", &p.to), ("keyId", &p.key_id)] {
+            if let Some(v) = v {
+                q.push((k, v.clone()));
+            }
+        }
+        self.client.call(Method::GET, "/usage", &q, None).await
+    }
+
+    /// `GET /v1/usage/errors` — the newest failed requests with a stable error code (code,
+    /// endpoint, time, request id).
+    pub async fn errors(&self, p: &UsageErrorsParams) -> Result<Vec<UsageError>> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = &p.code {
+            q.push(("code", v.clone()));
+        }
+        if let Some(v) = &p.key_id {
+            q.push(("keyId", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        let r: UsageErrorsResponse = self.client.call(Method::GET, "/usage/errors", &q, None).await?;
+        Ok(r.errors)
+    }
+}
+
+/// x402 pay-per-request facilitator (D-066), from [`LayerHop::x402`].
+#[derive(Debug, Clone, Copy)]
+pub struct X402<'a> {
+    client: &'a LayerHop,
+}
+
+impl<'a> X402<'a> {
+    /// `GET /v1/x402/supported` — public: the schemes and networks LayerHop verifies and settles,
+    /// and whether settlement is enabled.
+    pub async fn supported(&self) -> Result<X402Supported> {
+        self.client.call(Method::GET, "/x402/supported", &[], None).await
+    }
+
+    /// `POST /v1/x402/requirements` — the payment requirements to answer `402 Payment Required`
+    /// with, for a price you net per request paid out to `pay_to`. The requirements' `payTo` is
+    /// your own fee-splitting deposit address (one per resource and payout address).
+    pub async fn requirements(&self, p: &X402RequirementsParams) -> Result<X402Requirements> {
+        self.client.call(Method::POST, "/x402/requirements", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `POST /v1/x402/verify` — check a payment against your requirements (read-only). A
+    /// well-formed call always succeeds; `is_valid: false` carries the x402 `invalid_reason`.
+    pub async fn verify(&self, p: &X402FacilitatorRequest) -> Result<X402VerifyResponse> {
+        self.client.call(Method::POST, "/x402/verify", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// `POST /v1/x402/settle` — verify again and settle on chain (live keys; `FORBIDDEN` while
+    /// settlement is off). Idempotent per authorization. `error_reason: settlement_pending` means
+    /// sent but not confirmed yet; `x402.payment.settled` fires once it is.
+    pub async fn settle(&self, p: &X402FacilitatorRequest) -> Result<X402SettleResponse> {
+        self.client.call(Method::POST, "/x402/settle", &[], Some(serde_json::to_value(p)?)).await
+    }
+
+    /// Payments settled through LayerHop for your account.
+    pub fn payments(&self) -> X402Payments<'a> {
+        X402Payments { client: self.client }
+    }
+}
+
+/// x402 payments, from [`X402::payments`].
+#[derive(Debug, Clone, Copy)]
+pub struct X402Payments<'a> {
+    client: &'a LayerHop,
+}
+
+impl X402Payments<'_> {
+    /// `GET /v1/x402/payments` — newest first.
+    pub async fn list(&self, p: &ListX402PaymentsParams) -> Result<ListX402PaymentsResponse> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(v) = &p.status {
+            q.push(("status", v.clone()));
+        }
+        if let Some(v) = &p.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        if let Some(v) = p.limit {
+            q.push(("limit", v.to_string()));
+        }
+        self.client.call(Method::GET, "/x402/payments", &q, None).await
+    }
+
+    /// `GET /v1/x402/payments/{id}`.
+    pub async fn get(&self, id: &str) -> Result<X402Payment> {
+        let path = format!("/x402/payments/{}", urlencoding::encode(id));
+        self.client.call(Method::GET, &path, &[], None).await
     }
 }
 
@@ -1177,24 +1420,24 @@ async fn api_error(res: reqwest::Response) -> Error {
 
 /// Incremental Server-Sent Events parser: one line (without its terminator) at a time.
 struct SseParser {
-    event: &'static str,
+    events: Vec<&'static str>,
     name: String,
     data: Vec<String>,
 }
 
 impl SseParser {
-    fn new(event: &'static str) -> Self {
-        Self { event, name: "message".to_string(), data: Vec::new() }
+    fn new(events: Vec<&'static str>) -> Self {
+        Self { events, name: "message".to_string(), data: Vec::new() }
     }
 
-    /// The joined `data` of a completed frame named `event`. Comments (`:`) and other frames
-    /// (`ready`) are skipped.
-    fn line(&mut self, line: &str) -> Option<String> {
+    /// `(name, joined data)` of a completed frame named in `events`. Comments (`:`) and other
+    /// frames (`ready`) are skipped.
+    fn line(&mut self, line: &str) -> Option<(String, String)> {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
             let name = std::mem::replace(&mut self.name, "message".to_string());
             let data = std::mem::take(&mut self.data);
-            return (name == self.event && !data.is_empty()).then(|| data.join("\n"));
+            return (self.events.contains(&name.as_str()) && !data.is_empty()).then(|| (name, data.join("\n")));
         }
         if let Some(v) = line.strip_prefix("event:") {
             self.name = v.trim().to_string();
@@ -1205,11 +1448,82 @@ impl SseParser {
     }
 }
 
+/// Decode the JSON data of each frame as `T`. Ends after the first error.
+fn decode_frames<T, S>(frames: S) -> impl Stream<Item = Result<T>> + Send + 'static
+where
+    T: DeserializeOwned + Send + 'static,
+    S: Stream<Item = Result<(String, String)>> + Send + 'static,
+{
+    frames
+        .map(|r| r.and_then(|(_, data)| serde_json::from_str::<T>(&data).map_err(Error::Decode)))
+        .scan(false, |done, r| {
+            if *done {
+                return future::ready(None);
+            }
+            *done = r.is_err();
+            future::ready(Some(r))
+        })
+}
+
+/// The `error` event of a quote stream: an API error body plus its HTTP status.
+#[derive(Deserialize)]
+struct StreamErrorEvent {
+    #[serde(default)]
+    status: Option<u16>,
+    #[serde(default)]
+    error: Option<ErrorBody>,
+}
+
+/// Quote stream frames (`quote`, `error`, `end`) as updates. An `error` frame yields one
+/// [`Error::Api`] and ends the stream; `end` ends it cleanly.
+fn quote_events<S>(frames: S) -> impl Stream<Item = Result<QuoteStreamUpdate>> + Send + 'static
+where
+    S: Stream<Item = Result<(String, String)>> + Send + 'static,
+{
+    frames.scan(false, |done, r| {
+        if *done {
+            return future::ready(None);
+        }
+        let out = match r {
+            Err(e) => Some(Err(e)),
+            Ok((event, data)) => match event.as_str() {
+                "quote" => Some(serde_json::from_str::<QuoteStreamUpdate>(&data).map_err(Error::Decode)),
+                "error" => {
+                    let ev: StreamErrorEvent =
+                        serde_json::from_str(&data).unwrap_or(StreamErrorEvent { status: None, error: None });
+                    let e = ev.error.unwrap_or_default();
+                    Some(Err(Error::Api {
+                        code: e.code.unwrap_or_else(|| "INTERNAL".to_string()),
+                        message: e.message.unwrap_or_else(|| "Quote stream failed".to_string()),
+                        status: ev.status.unwrap_or(500),
+                        request_id: e.request_id,
+                        details: e.details.filter(|d| d.is_object()),
+                    }))
+                }
+                _ => None,
+            },
+        };
+        *done = !matches!(out, Some(Ok(_)));
+        future::ready(out)
+    })
+}
+
 /// Turn a response body into a stream of decoded `event` frames. Ends when the body ends (a
 /// partial trailing frame is dropped) or after the first error.
+#[cfg(test)]
 fn parse_sse<T, S, B>(body: S, event: &'static str) -> impl Stream<Item = Result<T>> + Send + 'static
 where
     T: DeserializeOwned + Send + 'static,
+    S: Stream<Item = reqwest::Result<B>> + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+{
+    decode_frames(parse_frames(body, vec![event]))
+}
+
+/// Turn a response body into a stream of `(event, data)` frames named in `events`. Ends when the
+/// body ends (a partial trailing frame is dropped) or after a transport error.
+fn parse_frames<S, B>(body: S, events: Vec<&'static str>) -> impl Stream<Item = Result<(String, String)>> + Send + 'static
+where
     S: Stream<Item = reqwest::Result<B>> + Send + 'static,
     B: AsRef<[u8]> + Send + 'static,
 {
@@ -1219,7 +1533,7 @@ where
         parser: SseParser,
         done: bool,
     }
-    let init = State { body: Box::pin(body), buf: Vec::new(), parser: SseParser::new(event), done: false };
+    let init = State { body: Box::pin(body), buf: Vec::new(), parser: SseParser::new(events), done: false };
     stream::unfold(init, |mut st| async move {
         if st.done {
             return None;
@@ -1228,14 +1542,8 @@ where
             while let Some(pos) = st.buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = st.buf.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line[..pos]);
-                if let Some(data) = st.parser.line(&line) {
-                    return match serde_json::from_str::<T>(&data) {
-                        Ok(v) => Some((Ok(v), st)),
-                        Err(e) => {
-                            st.done = true;
-                            Some((Err(Error::Decode(e)), st))
-                        }
-                    };
+                if let Some(frame) = st.parser.line(&line) {
+                    return Some((Ok(frame), st));
                 }
             }
             match st.body.next().await {
@@ -1286,12 +1594,49 @@ mod tests {
 
     #[test]
     fn parser_handles_data_prefix_variants() {
-        let mut p = SseParser::new("event");
+        let mut p = SseParser::new(vec!["event"]);
         assert_eq!(p.line("event:event"), None);
         assert_eq!(p.line("data:x"), None);
         assert_eq!(p.line("data:  y"), None);
-        assert_eq!(p.line(""), Some("x\n y".to_string()));
+        assert_eq!(p.line(""), Some(("event".to_string(), "x\n y".to_string())));
         assert_eq!(p.line("data: z"), None);
         assert_eq!(p.line("\r"), None); // a frame with the default name "message" is ignored
+    }
+
+    const QUOTE: &str = r#"{"seq":1,"best":{"quoteId":"q_1","provider":"relay","dstAmount":"1","dstAmountMin":"1","estimatedSeconds":5,"fees":{"ourFeeBps":25},"expiresAt":1},"quotes":[]}"#;
+
+    #[tokio::test]
+    async fn quote_events_yield_updates_then_end() {
+        let text = format!(
+            "event: ready\ndata: {{\"intervalMs\":10000}}\n\n: ping\n\nevent: quote\ndata: {QUOTE}\n\nevent: end\ndata: {{\"reason\":\"expired\",\"quotesSent\":1}}\n\nevent: quote\ndata: {QUOTE}\n\n"
+        );
+        let chunks: &'static str = Box::leak(text.into_boxed_str());
+        let got: Vec<Result<QuoteStreamUpdate>> =
+            quote_events(parse_frames(body(&[chunks]), vec!["quote", "error", "end"])).collect().await;
+        assert_eq!(got.len(), 1);
+        let u = got[0].as_ref().unwrap();
+        assert_eq!(u.seq, 1);
+        assert_eq!(u.response.best.quote_id, "q_1");
+    }
+
+    #[tokio::test]
+    async fn quote_events_error_frame_is_api_error() {
+        let text = format!(
+            "event: quote\ndata: {QUOTE}\n\nevent: error\ndata: {{\"status\":404,\"error\":{{\"code\":\"NO_ROUTE\",\"message\":\"No route\",\"requestId\":\"req_1\",\"details\":{{\"errors\":[]}}}}}}\n\nevent: quote\ndata: {QUOTE}\n\n"
+        );
+        let chunks: &'static str = Box::leak(text.into_boxed_str());
+        let got: Vec<Result<QuoteStreamUpdate>> =
+            quote_events(parse_frames(body(&[chunks]), vec!["quote", "error", "end"])).collect().await;
+        assert_eq!(got.len(), 2);
+        assert!(got[0].is_ok());
+        match &got[1] {
+            Err(e @ Error::Api { status, request_id, .. }) => {
+                assert_eq!(e.code(), Some("NO_ROUTE"));
+                assert_eq!(*status, 404);
+                assert_eq!(request_id.as_deref(), Some("req_1"));
+                assert!(e.details().is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

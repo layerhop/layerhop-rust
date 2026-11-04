@@ -37,7 +37,17 @@ pub mod webhook;
 
 pub use client::{
     Checkout, CheckoutProducts, CheckoutRefunds, DepositAddresses, Invoices, LayerHop, LayerHopBuilder, LimitOrders,
-    Payouts, RecurringOrders, Splits, Subscriptions, WatchOptions, Webhooks, DEFAULT_BASE_URL,
+    Payouts, RecurringOrders, Splits, Subscriptions, Usage, WatchOptions, Webhooks, X402Payments, DEFAULT_BASE_URL,
+    X402,
+};
+pub use models::{
+    CheckoutBitcoin, CheckoutBitcoinQuote, CheckoutTransfer, CheckoutTransferFee, CheckoutTransferTx,
+    ExactOutputQuoteParams, ListX402PaymentsParams, ListX402PaymentsResponse, QuoteStreamOptions, QuoteStreamUpdate,
+    QuoteWarning, SanctionedAddress, ScreenResponse, ScreeningAnnotation, ScreeningList, ScreeningResult,
+    StatusClassCounts, UsageEndpoint, UsageError, UsageErrorCode, UsageErrorsParams, UsageParams, UsagePoint,
+    UsageReport, UsageTotals, WebhookResendDelivery, WebhookResendResult, X402Fee, X402FacilitatorRequest, X402Kind,
+    X402Payee, X402Payment, X402Requirements, X402RequirementsParams, X402SettleResponse, X402Supported,
+    X402VerifyResponse,
 };
 pub use error::{Error, Result};
 pub use models::{

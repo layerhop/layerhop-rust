@@ -101,7 +101,11 @@ async fn main() -> layerhop::Result<()> {
 | `prices(&[ids])` | `GET /v1/prices?ids=chainId:address,...` |
 | `balances(&BalancesParams)` | `GET /v1/balances?address=&chains=&tokens=&fresh=` |
 | `quote(&QuoteParams)` | `GET /v1/quote` |
+| `quote_exact_output(&ExactOutputQuoteParams)` | `GET /v1/quote?dstAmount=` (receive an exact amount) |
+| `quote_stream(&QuoteParams, &QuoteStreamOptions)` | `GET /v1/quote/stream` (SSE), a `Stream` of `QuoteStreamUpdate` |
+| `quote_stream_exact_output(&ExactOutputQuoteParams, &QuoteStreamOptions)` | `GET /v1/quote/stream?dstAmount=` (SSE) |
 | `quote_calls(&CallsQuoteParams)` | `POST /v1/quote` (exact output + destination calls) |
+| `screen(&[addresses])` | `POST /v1/screen` (OFAC SDN list, public) |
 | `build_tx(quote_id)` | `POST /v1/orders` → `BuiltTx::Evm` / `Svm` / `Tvm` |
 | `build_gasless(quote_id)` | `POST /v1/orders` for a gasless quote → `GaslessSignRequest` |
 | `submit_gasless(quote_id, trade_sig, Option<approval_sig>)` | `POST /v1/orders/gasless` |
@@ -118,6 +122,8 @@ async fn main() -> layerhop::Result<()> {
 | `checkout().get(id)` | `GET /v1/checkout/sessions/{id}` (public) |
 | `checkout().expire(id)` | `POST /v1/checkout/sessions/{id}/expire` |
 | `checkout().quote(id, &CheckoutQuoteParams)` | `POST /v1/checkout/sessions/{id}/quote` (public) |
+| `checkout().start_transfer(id)` | `POST /v1/checkout/sessions/{id}/transfer` (public, "Send to address" QR) |
+| `checkout().start_bitcoin(id, Option<refund_address>)` | `POST /v1/checkout/sessions/{id}/bitcoin` (public, Pay with Bitcoin) |
 | `checkout().stream(id)` | `GET /v1/checkout/sessions/{id}/events` (SSE, public) |
 | `checkout().products().create(&CreateCheckoutProductParams)` | `POST /v1/checkout/products` |
 | `checkout().products().list(&ListCheckoutProductsParams)` | `GET /v1/checkout/products?active=&cursor=&limit=` |
@@ -166,7 +172,17 @@ async fn main() -> layerhop::Result<()> {
 | `payouts().transfers(&PayoutTransfersParams)` | `POST /v1/payouts/transfers` (public) |
 | `service_status()` | `GET /v1/status` (public) |
 | `webhooks().stream()` | `GET /v1/webhooks/stream` (SSE, API key) |
+| `webhooks().stream_since(since)` | `GET /v1/webhooks/stream?since=` (replays missed events first) |
 | `webhooks().trigger(event_type)` | `POST /v1/webhooks/trigger` (test keys only) |
+| `webhooks().resend(event_id, Option<endpoint_id>)` | `POST /v1/webhooks/events/{id}/resend` |
+| `usage().get(&UsageParams)` | `GET /v1/usage?bucket=&from=&to=&keyId=` |
+| `usage().errors(&UsageErrorsParams)` | `GET /v1/usage/errors?code=&keyId=&limit=` |
+| `x402().supported()` | `GET /v1/x402/supported` (public) |
+| `x402().requirements(&X402RequirementsParams)` | `POST /v1/x402/requirements` |
+| `x402().verify(&X402FacilitatorRequest)` | `POST /v1/x402/verify` |
+| `x402().settle(&X402FacilitatorRequest)` | `POST /v1/x402/settle` (live keys) |
+| `x402().payments().list(&ListX402PaymentsParams)` | `GET /v1/x402/payments?status=&cursor=&limit=` |
+| `x402().payments().get(id)` | `GET /v1/x402/payments/{id}` |
 
 Builder options: `base_url`, `api_key` (sent as `x-api-key`), `channel` (`api` by default),
 `integrator` (your partner id), `integrator_fee_bps`, `http_client` (your own `reqwest::Client`).
@@ -191,6 +207,65 @@ while let Some(order) = orders.next().await {
 The request is sent on the first poll; drop the stream to close the connection. A client-wide
 `reqwest` timeout also cuts streams, so leave it unset on a client used for them. Guide:
 https://docs.layerhop.com/guides/live-status
+
+## Live quotes
+
+`quote_stream` keeps a quote fresh over Server-Sent Events (`GET /v1/quote/stream`): it yields a
+ranked quote set at once, then whenever the best route or any amount changes (and before the shown
+quote expires), for up to 5 minutes. Each refresh counts as one request against your rate limit;
+at most 3 open streams per key. A refresh that fails (`NO_ROUTE`, `RATE_LIMITED`,
+`ADDRESS_SANCTIONED`, ...) yields one `Error::Api` and ends the stream.
+
+```rust
+use futures_util::StreamExt;
+use layerhop::QuoteStreamOptions;
+
+let mut quotes = Box::pin(lh.quote_stream(&params, &QuoteStreamOptions { interval_ms: Some(10_000) }));
+while let Some(update) = quotes.next().await {
+    let update = update?;
+    println!("#{} {} via {:?}", update.seq, update.response.best.dst_amount, update.response.best.provider);
+}
+```
+
+`quote_stream_exact_output` does the same for an exact output. Guide:
+https://docs.layerhop.com/guides/live-quotes
+
+## Receive an exact amount
+
+`quote_exact_output` quotes a fixed output (`dstAmount`): each quote reports `src_amount` (what the
+sender pays) and `src_amount_max` (the most the transaction can take; check balances and approvals
+against it). Only providers that quote a fixed output answer; not with gas on arrival or gasless.
+
+```rust
+use layerhop::ExactOutputQuoteParams;
+
+let q = lh
+    .quote_exact_output(&ExactOutputQuoteParams {
+        src_chain: "base".into(),
+        src_token: "USDC".into(),
+        dst_chain: "arbitrum".into(),
+        dst_token: "USDC".into(),
+        dst_amount: "10000000".into(), // the recipient gets exactly 10 USDC
+        sender: "0x...".into(),
+        recipient: "0x...".into(),
+        ..Default::default()
+    })
+    .await?;
+println!("pay {:?} (at most {:?})", q.best.src_amount, q.best.src_amount_max);
+```
+
+## Address screening
+
+`screen` checks up to 100 addresses against the OFAC SDN list (public). Quotes and checkout quotes
+also carry `screening` with any listed address of the request. Where the API enforces screening, a
+listed address fails with `ADDRESS_SANCTIONED` (HTTP 451). A list lookup only, not legal advice.
+
+```rust
+let r = lh.screen(&["0x098B716B8Aaf21512996dC57EB0615e2383E2f96"]).await?;
+if r.results[0].sanctioned { /* r.results[0].lists, e.g. ["OFAC SDN"] */ }
+```
+
+Guide: https://docs.layerhop.com/guides/address-screening
 
 ## Checkout (pay with any token)
 
@@ -238,7 +313,41 @@ let tx = lh.build_tx(&q.best.quote_id).await?;
 ```
 
 `checkout().list(..)` pages through your sessions and `checkout().expire(id)` cancels an open one.
-See the [checkout guide](https://docs.layerhop.com/guides/checkout).
+`embed_origins` limits which sites may show the session in an iframe.
+
+When `transfer_available` is true, `checkout().start_transfer(id)` shows a "Send to address" QR
+and returns the session with its `transfer` (what to send where, and what arrived). Where Pay with
+Bitcoin is on (`bitcoin_available`), `checkout().start_bitcoin(id, Some(refund_address))` returns
+the session with its `bitcoin` (BIP21 `uri`, exact `amount_sats`, `expires_at`); call it again once
+expired for a fresh quote. `payment.method` is `wallet` or `transfer` (`quote_id` is `None` for a
+transfer). See the [checkout guide](https://docs.layerhop.com/guides/checkout).
+
+## x402 pay-per-request
+
+Charge USDC per HTTP request with the open x402 protocol; LayerHop verifies and settles (D-066).
+Answer `402 Payment Required` with `requirements`, then `verify` and `settle` the payer's header:
+
+```rust
+use layerhop::{X402FacilitatorRequest, X402RequirementsParams};
+
+let req = lh
+    .x402()
+    .requirements(&X402RequirementsParams {
+        amount: "10000".into(), // you net 0.01 USDC per request
+        pay_to: "0xYourWallet".into(),
+        resource: "https://api.example.com/v1/weather".into(),
+        ..Default::default()
+    })
+    .await?;
+// 402 body: { "x402Version": 1, "accepts": req.accepts_v1 }; PAYMENT-REQUIRED header: base64(req.payment_required)
+let body = X402FacilitatorRequest { x402_version: Some(1), payment_payload, payment_requirements: req.accepts_v1[0].clone() };
+if lh.x402().verify(&body).await?.is_valid {
+    let s = lh.x402().settle(&body).await?; // s.success, or s.error_reason == Some("settlement_pending")
+}
+```
+
+`x402().payments().list(..)` / `get(id)` read settled payments; `x402.payment.settled` fires for
+each. Guide: https://docs.layerhop.com/guides/x402
 
 ## Products and payment buttons
 
@@ -730,7 +839,7 @@ sample event in test mode (test keys only; a live key returns `Error::Api` with 
 Event types: `order.*` (`submitted`, `filled`, `refunded`, `failed`, `dropped`), `checkout.session.*`
 (`processing`, `completed`, `payment_failed`, `expired`, `refunded`), `invoice.sent`,
 `invoice.paid`, `subscription.*` (`created`, `renewed`, `past_due`, `canceled`) and
-`limit_order.*` (`opened`, `filled`, `cancelled`, `expired`, `failed`).
+`limit_order.*` (`opened`, `filled`, `cancelled`, `expired`, `failed`) and `x402.payment.settled`.
 
 ```rust
 let lh = LayerHop::builder().api_key("lh_test_...").build();
@@ -741,6 +850,17 @@ while let Some(event) = events.next().await {
     println!("{} {:?}", event.event_type, event.data.order);
 }
 ```
+
+After a disconnect, `webhooks().stream_since(&last.created_at)` first replays the events created
+since then (at most an hour back). `webhooks().resend(event_id, None)` sends an event again to
+every subscribed endpoint and open stream (`Some(endpoint_id)` for one endpoint).
+
+### Usage and errors
+
+`usage().get(&UsageParams { bucket: Some("day".into()), ..Default::default() })` returns the key's
+requests per hour or day with status classes, p50 / p95 latency, endpoint groups and error codes;
+`usage().errors(&UsageErrorsParams { code: Some("NO_ROUTE".into()), ..Default::default() })` lists
+the newest failed requests with their `request_id`.
 
 ## Development
 
